@@ -43,13 +43,10 @@ contract LiquidityRouterUnichain is IUnlockCallback {
         (PoolKey memory poolKey, address payer) = abi.decode(data, (PoolKey, address));
 
         // Add liquidity
-        (BalanceDelta delta, ) = poolManager.modifyLiquidity(
+        (BalanceDelta delta,) = poolManager.modifyLiquidity(
             poolKey,
             IPoolManager.ModifyLiquidityParams({
-                tickLower: TICK_LOWER,
-                tickUpper: TICK_UPPER,
-                liquidityDelta: LIQUIDITY_DELTA,
-                salt: bytes32(0)
+                tickLower: TICK_LOWER, tickUpper: TICK_UPPER, liquidityDelta: LIQUIDITY_DELTA, salt: bytes32(0)
             }),
             ""
         );
@@ -63,17 +60,13 @@ contract LiquidityRouterUnichain is IUnlockCallback {
         if (delta.amount0() < 0) {
             uint256 owed0 = uint256(uint128(-delta.amount0()));
             poolManager.sync(poolKey.currency0);
-            IERC20(Currency.unwrap(poolKey.currency0)).transferFrom(
-                payer, address(poolManager), owed0
-            );
+            IERC20(Currency.unwrap(poolKey.currency0)).transferFrom(payer, address(poolManager), owed0);
             poolManager.settle();
         }
         if (delta.amount1() < 0) {
             uint256 owed1 = uint256(uint128(-delta.amount1()));
             poolManager.sync(poolKey.currency1);
-            IERC20(Currency.unwrap(poolKey.currency1)).transferFrom(
-                payer, address(poolManager), owed1
-            );
+            IERC20(Currency.unwrap(poolKey.currency1)).transferFrom(payer, address(poolManager), owed1);
             poolManager.settle();
         }
 
@@ -101,8 +94,7 @@ contract LiquidityRouterUnichain is IUnlockCallback {
 ///       --with-gas-price 100000000 -vvvv
 contract AddLiquidityUnichain is Script {
     // ── Addresses (Unichain Mainnet) ────────────────────────
-    IPoolManager constant POOL_MANAGER =
-        IPoolManager(0x1F98400000000000000000000000000000000004);
+    IPoolManager constant POOL_MANAGER = IPoolManager(0x1F98400000000000000000000000000000000004);
 
     // Unichain: USDC sorts before WETH → currency0 = USDC, currency1 = WETH
     address constant USDC = 0x078D782b760474a361dDA0AF3839290b0EF57AD6;

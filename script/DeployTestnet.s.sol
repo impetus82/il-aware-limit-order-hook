@@ -72,7 +72,7 @@ contract DeployTestnet is Script {
             deployer,
             address(0) // yieldVault: address(0) for testnet
         );
-        
+
         vm.stopBroadcast();
 
         // ---- Verify ----
@@ -83,7 +83,10 @@ contract DeployTestnet is Script {
         console2.log("Owner:", hook.owner());
 
         console2.log("\n--- Verify on Etherscan ---");
-        console2.log("forge verify-contract", address(hook),
-            "src/ILAwareLimitOrderHook.sol:ILAwareLimitOrderHook --chain sepolia");
+        console2.log(
+            "forge verify-contract",
+            address(hook),
+            "src/ILAwareLimitOrderHook.sol:ILAwareLimitOrderHook --chain sepolia"
+        );
     }
 }

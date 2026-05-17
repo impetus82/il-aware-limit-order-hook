@@ -76,15 +76,11 @@ contract RecoverPool is Script {
         //   (target is tick 0 / price ~1.0, which is sqrtPriceX96 = 2^96 ≈ 7.92e28)
         //   Using MIN + 1 is safe - the pool will stop when liquidity runs out
         IPoolManager.SwapParams memory swapParams = IPoolManager.SwapParams({
-            zeroForOne: true,
-            amountSpecified: -int256(SWAP_AMOUNT),
-            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            zeroForOne: true, amountSpecified: -int256(SWAP_AMOUNT), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
         });
 
-        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest.TestSettings({
-            takeClaims: false,
-            settleUsingBurn: false
-        });
+        PoolSwapTest.TestSettings memory testSettings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
         swapRouter.swap(poolKey, swapParams, testSettings, "");
 
