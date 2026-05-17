@@ -1,0 +1,29 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+test = "test"
+script = "script"
+
+# Solidity версия (V4 требует 0.8.26+)
+solc = "0.8.26"
+evm_version = "cancun"
+
+# Оптимизация
+optimizer = true
+optimizer_runs = 1000000
+via_ir = true
+
+# Remappings для импортов
+remappings = [
+    "@uniswap/v4-core/=lib/v4-core/",
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "forge-std/=lib/forge-std/src/",
+]
+
+# Gas reporting
+gas_reports = ["*"]
+
+# Fuzz testing
+[fuzz]
+runs = 256
