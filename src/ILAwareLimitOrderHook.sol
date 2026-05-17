@@ -121,9 +121,9 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                             DATA STRUCTURES
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Packed limit order structure
+    /// @notice Packed limit order structure.
+    /// @dev creator field removed; ownership is tracked via ERC721 ownerOf(orderId).
     struct LimitOrder {
-        address creator;
         uint96 amount0;
         uint96 amount1;
         address token0;
@@ -355,7 +355,6 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         }
 
         orders[orderId] = LimitOrder({
-            creator: msg.sender,
             amount0: zeroForOne ? amountIn : 0,
             amount1: zeroForOne ? 0 : amountIn,
             token0: token0Addr,
@@ -367,6 +366,9 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             vaultShares: 0,
             sqrtPriceAtFill: 0
         });
+
+        // Mint ERC721 NFT representing this position (orderId = tokenId)
+        _mint(msg.sender, orderId);
 
         userOrders[msg.sender].push(orderId);
 
@@ -388,13 +390,13 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
 
     /// @notice Cancel an active order and return deposited tokens
     /// @dev Removes the order from its tick bucket. If the bucket becomes empty,
-    ///      removes the tick from the active linked list.
+    ///      removes the tick from the active linked list. Burns the ERC721 NFT.
     ///      Protected by ReentrancyGuard against ERC-777 callbacks.
     /// @param orderId The ID of the order to cancel
     function cancelOrder(uint256 orderId) external nonReentrant {
         LimitOrder storage order = orders[orderId];
 
-        if (order.creator != msg.sender) revert NotOrderCreator();
+        if (ownerOf(orderId) != msg.sender) revert NotOrderCreator();
         if (order.isFilled) revert OrderAlreadyFilled();
 
         // Remove from tick bucket
@@ -419,8 +421,8 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             IERC20(order.token1).safeTransfer(msg.sender, uint256(order.amount1));
         }
 
-        // Mark as cancelled (zero out creator)
-        order.creator = address(0);
+        // Burn NFT to mark position as closed
+        _burn(orderId);
 
         emit OrderCancelled(orderId, msg.sender);
     }
@@ -429,19 +431,15 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                        ADMIN FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Force-cancel an orphaned or stuck order (admin only)
-    /// @dev Used to clean up orders where creator == address(0) but isFilled == false
-    ///      (e.g., Order #0 from Phase 3.13), or orders stuck due to token issues.
-    ///      Returns funds to the original creator if still set; otherwise just cleans state.
+    /// @notice Force-cancel a stuck order (admin only). Returns tokens to current NFT owner.
     /// @param orderId The ID of the order to force-cancel
     function forceCancelOrder(uint256 orderId) external onlyOwner {
         LimitOrder storage order = orders[orderId];
 
         if (order.isFilled) revert OrderAlreadyFilled();
-        // Allow force-cancel even if creator == address(0) (orphaned order)
-        if (order.creator == address(0) && order.amount0 == 0 && order.amount1 == 0) {
-            revert OrderNotActive();
-        }
+        if (_ownerOf(orderId) == address(0)) revert OrderNotActive(); // burned = already cancelled
+
+        address recipient = ownerOf(orderId);
 
         // Remove from tick bucket
         int24 tick = orderTickBucket[orderId];
@@ -453,26 +451,22 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             }
         }
 
-        // If tick bucket is now empty, remove from linked list
         if (tickToOrders[tick].length == 0) {
             _removeActiveTick(tick);
         }
 
-        // Return tokens to creator if they exist, otherwise tokens stay in contract
-        // (admin can recover via separate mechanism if needed)
-        address recipient = order.creator;
-        if (recipient != address(0)) {
-            if (order.zeroForOne && order.amount0 > 0) {
-                IERC20(order.token0).safeTransfer(recipient, uint256(order.amount0));
-            } else if (!order.zeroForOne && order.amount1 > 0) {
-                IERC20(order.token1).safeTransfer(recipient, uint256(order.amount1));
-            }
+        // Return tokens to current NFT owner
+        if (order.zeroForOne && order.amount0 > 0) {
+            IERC20(order.token0).safeTransfer(recipient, uint256(order.amount0));
+        } else if (!order.zeroForOne && order.amount1 > 0) {
+            IERC20(order.token1).safeTransfer(recipient, uint256(order.amount1));
         }
 
-        // Mark as cancelled
-        order.creator = address(0);
         order.amount0 = 0;
         order.amount1 = 0;
+
+        // Burn the NFT to close the position
+        _burn(orderId);
 
         emit OrderForceCancelled(orderId, msg.sender);
     }
@@ -659,8 +653,8 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             uint256 orderId = orderIdsInTick[i];
             LimitOrder storage order = orders[orderId];
 
-            // Lazy cleanup: remove filled/cancelled orders
-            if (order.creator == address(0) || order.isFilled) {
+            // Lazy cleanup: remove filled or burned (cancelled) orders
+            if (order.isFilled || _ownerOf(orderId) == address(0)) {
                 _removeFromArray(orderIdsInTick, i);
                 continue;
             }
@@ -737,6 +731,8 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     ) internal returns (bool success) {
         isExecuting = true;
 
+        // Capture current owner for refunds and events (ERC721 owner at fill time)
+        address orderOwner = ownerOf(orderId);
         uint96 amountIn = order.zeroForOne ? order.amount0 : order.amount1;
 
         // Get current price for slippage limit
@@ -792,10 +788,10 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                 order.isFilled = true;
                 order.amount1 = netAmount.toUint96();
                 uint256 refund = uint256(amountIn) - actualInput;
-                if (refund > 0) IERC20(order.token0).safeTransfer(order.creator, refund);
+                if (refund > 0) IERC20(order.token0).safeTransfer(orderOwner, refund);
 
                 emit OrderExecutionFailed(orderId, "SlippageExceeded");
-                emit OrderFilled(orderId, order.creator, uint96(actualInput), netAmount.toUint96(), sqrtPriceToUint128(currentSqrtPriceX96));
+                emit OrderFilled(orderId, orderOwner, uint96(actualInput), netAmount.toUint96(), sqrtPriceToUint128(currentSqrtPriceX96));
                 isExecuting = false;
                 return true;
             }
@@ -810,7 +806,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             order.isFilled = true;
             order.amount1 = netAmount.toUint96();
             uint256 refund0 = uint256(amountIn) - actualInput;
-            if (refund0 > 0) IERC20(order.token0).safeTransfer(order.creator, refund0);
+            if (refund0 > 0) IERC20(order.token0).safeTransfer(orderOwner, refund0);
         } else {
             // swapDelta.amount1() is negative (hook owes token1 to pool)
             int128 deltaAmount1 = swapDelta.amount1();
@@ -842,10 +838,10 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                 order.isFilled = true;
                 order.amount0 = netAmount.toUint96();
                 uint256 refund = uint256(amountIn) - actualInput;
-                if (refund > 0) IERC20(order.token1).safeTransfer(order.creator, refund);
+                if (refund > 0) IERC20(order.token1).safeTransfer(orderOwner, refund);
 
                 emit OrderExecutionFailed(orderId, "SlippageExceeded");
-                emit OrderFilled(orderId, order.creator, uint96(actualInput), netAmount.toUint96(), sqrtPriceToUint128(currentSqrtPriceX96));
+                emit OrderFilled(orderId, orderOwner, uint96(actualInput), netAmount.toUint96(), sqrtPriceToUint128(currentSqrtPriceX96));
                 isExecuting = false;
                 return true;
             }
@@ -860,12 +856,12 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             order.isFilled = true;
             order.amount0 = netAmount.toUint96();
             uint256 refund1 = uint256(amountIn) - actualInput;
-            if (refund1 > 0) IERC20(order.token1).safeTransfer(order.creator, refund1);
+            if (refund1 > 0) IERC20(order.token1).safeTransfer(orderOwner, refund1);
         }
 
         emit OrderFilled(
             orderId,
-            order.creator,
+            orderOwner,
             uint96(order.zeroForOne ? uint256(uint128(-swapDelta.amount0())) : uint256(uint128(-swapDelta.amount1()))),
             order.zeroForOne ? order.amount1 : order.amount0,
             sqrtPriceToUint128(currentSqrtPriceX96)
@@ -1040,7 +1036,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @param orderId The filled limit order whose output tokens should be deposited
     function depositToVault(uint256 orderId) external nonReentrant {
         LimitOrder storage order = orders[orderId];
-        if (order.creator != msg.sender) revert NotOrderCreator();
+        if (ownerOf(orderId) != msg.sender) revert NotOrderCreator();
         if (!order.isFilled) revert OrderNotFilled();
         if (yieldVault == address(0)) return;
         if (order.vaultShares > 0) return;
@@ -1065,7 +1061,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     function claimOrder(uint256 orderId, PoolKey calldata poolKey) external nonReentrant {
         LimitOrder storage order = orders[orderId];
         if (!order.isFilled) revert OrderNotFilled();
-        if (order.creator != msg.sender) revert NotOrderCreator(); // Step 4: replaced by ownerOf
+        if (ownerOf(orderId) != msg.sender) revert NotOrderCreator();
 
         // Determine output
         address outputToken = order.zeroForOne ? order.token1 : order.token0;
@@ -1100,9 +1096,10 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             order.vaultShares = 0;
         }
 
-        // Mark claimed
+        // Mark claimed and burn the ERC721 position token
         order.amount0 = 0;
         order.amount1 = 0;
+        _burn(orderId);
 
         IERC20(outputToken).safeTransfer(msg.sender, totalOut);
     }

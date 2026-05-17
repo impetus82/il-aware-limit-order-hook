@@ -174,7 +174,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         uint256 orderId = hook.createLimitOrder(poolKey, true, 1e18, 1.002e18);
         
         ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
-        assertEq(order.creator, alice);
+        assertEq(hook.ownerOf(orderId), alice, "ERC721 owner should be alice");
         assertEq(order.amount0, 1e18);
         assertTrue(order.zeroForOne);
         assertFalse(order.isFilled);
@@ -225,8 +225,9 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         
         assertEq(token0.balanceOf(alice) - aliceToken0Before, 1e18);
         
-        ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
-        assertEq(order.creator, address(0));
+        // NFT should be burned after cancel (ownerOf should revert)
+        vm.expectRevert();
+        hook.ownerOf(orderId);
     }
 
     function testUnauthorizedCancellationFails() public {
@@ -645,8 +646,10 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         assertEq(aliceBalAfter - aliceBalBefore, 5e18, "Tokens should be returned to creator");
 
         ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
-        assertEq(order.creator, address(0), "Creator should be zeroed");
-        assertEq(order.amount0, 0, "Amount should be zeroed");
+        assertEq(order.amount0, 0, "Amount should be zeroed after force cancel");
+        // NFT burned — ownerOf should revert
+        vm.expectRevert();
+        hook.ownerOf(orderId);
 
         int24 tick = hook.getTickBucket(orderId);
         assertFalse(hook.isActiveTick(tick), "Tick should be removed after force cancel");
@@ -1150,6 +1153,79 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
 
         assertTrue(aliceAfter > aliceBefore, "Alice should receive tokens via claimOrder");
         console2.log("Alice received on claim:", aliceAfter - aliceBefore);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+              BLOCK 3: ERC721 TOKENIZED POSITIONS TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice ERC721 is minted to the creator on createLimitOrder
+    function test_ERC721_MintedOnCreate() public {
+        vm.prank(alice);
+        uint256 orderId = hook.createLimitOrder(poolKey, true, 1e18, 1.002e18);
+        assertEq(hook.ownerOf(orderId), alice, "ERC721 should be minted to creator");
+    }
+
+    /// @notice Transferring the NFT changes the owner; burn happens on cancel
+    function test_ERC721_Transfer() public {
+        vm.prank(alice);
+        uint256 orderId = hook.createLimitOrder(poolKey, true, 1e18, 1.002e18);
+        assertEq(hook.ownerOf(orderId), alice, "Initial owner should be alice");
+
+        // Alice transfers the NFT to bob
+        vm.prank(alice);
+        hook.transferFrom(alice, bob, orderId);
+        assertEq(hook.ownerOf(orderId), bob, "Owner should be bob after transfer");
+
+        // Bob can now cancel the order
+        uint256 bobBefore = token0.balanceOf(bob);
+        vm.prank(bob);
+        hook.cancelOrder(orderId);
+        assertTrue(token0.balanceOf(bob) > bobBefore, "Bob should receive refund after cancel");
+
+        // NFT is burned
+        vm.expectRevert();
+        hook.ownerOf(orderId);
+    }
+
+    /// @notice New NFT owner can claim a filled order (transfer + fill + claim by new owner)
+    function test_ERC721_Claim_After_Transfer() public {
+        // Alice creates order, fills it
+        vm.prank(alice);
+        uint256 orderId = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
+
+        // Fill the order via swap
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            poolKey,
+            IPoolManager.SwapParams({zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
+        assertTrue(order.isFilled, "Order must be filled");
+
+        // Alice transfers the filled-order NFT to bob (secondary market)
+        vm.prank(alice);
+        hook.transferFrom(alice, bob, orderId);
+        assertEq(hook.ownerOf(orderId), bob, "Bob should own the NFT after transfer");
+
+        // Alice cannot claim (not owner)
+        vm.prank(alice);
+        vm.expectRevert(ILAwareLimitOrderHook.NotOrderCreator.selector);
+        hook.claimOrder(orderId, poolKey);
+
+        // Bob can claim
+        uint256 bobToken0Before = token0.balanceOf(bob);
+        vm.prank(bob);
+        hook.claimOrder(orderId, poolKey);
+        assertTrue(token0.balanceOf(bob) > bobToken0Before, "Bob should receive order output");
+
+        // NFT is burned after claim
+        vm.expectRevert();
+        hook.ownerOf(orderId);
     }
 
     /// @notice claimOrder works gracefully when vault is not configured (vaultShares == 0)
