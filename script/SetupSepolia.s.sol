@@ -36,7 +36,7 @@ contract SetupSepolia is Script {
     uint256 constant MINT_AMOUNT = 10_000_000 ether; // 10M tokens each
     uint256 constant LIQUIDITY_AMOUNT = 10_000_000 ether; // match liquidity needs
     int24 constant TICK_LOWER = -887220; // near-MIN_TICK, кратно tickSpacing=60
-    int24 constant TICK_UPPER = 887220;  // near-MAX_TICK, кратно tickSpacing=60
+    int24 constant TICK_UPPER = 887220; // near-MAX_TICK, кратно tickSpacing=60
     int256 constant LIQUIDITY_DELTA = 10_000_000e18; // 10M units - глубокий пул
 
     function run() external {
@@ -59,9 +59,7 @@ contract SetupSepolia is Script {
         console2.log("TokenB deployed:", address(tokenB));
 
         // ---- Step 2: Sort tokens (currency0 < currency1) ----
-        (MockERC20 token0, MockERC20 token1) = address(tokenA) < address(tokenB)
-            ? (tokenA, tokenB)
-            : (tokenB, tokenA);
+        (MockERC20 token0, MockERC20 token1) = address(tokenA) < address(tokenB) ? (tokenA, tokenB) : (tokenB, tokenA);
         console2.log("Token0 (sorted):", address(token0));
         console2.log("Token1 (sorted):", address(token1));
 
@@ -71,9 +69,7 @@ contract SetupSepolia is Script {
         console2.log("Minted 1M of each token to deployer");
 
         // ---- Step 4: Deploy PoolModifyLiquidityTest (helper router) ----
-        PoolModifyLiquidityTest lpRouter = new PoolModifyLiquidityTest(
-            IPoolManager(POOL_MANAGER)
-        );
+        PoolModifyLiquidityTest lpRouter = new PoolModifyLiquidityTest(IPoolManager(POOL_MANAGER));
         console2.log("LP Router deployed:", address(lpRouter));
 
         // ---- Step 5: Build PoolKey ----
@@ -98,10 +94,7 @@ contract SetupSepolia is Script {
         lpRouter.modifyLiquidity(
             poolKey,
             IPoolManager.ModifyLiquidityParams({
-                tickLower: TICK_LOWER,
-                tickUpper: TICK_UPPER,
-                liquidityDelta: LIQUIDITY_DELTA,
-                salt: bytes32(0)
+                tickLower: TICK_LOWER, tickUpper: TICK_UPPER, liquidityDelta: LIQUIDITY_DELTA, salt: bytes32(0)
             }),
             "" // hookData
         );

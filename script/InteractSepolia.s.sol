@@ -108,12 +108,13 @@ contract CreateOrder is SepoliaConfig {
 
         // Step 3: Create the limit order
         PoolKey memory poolKey = _buildPoolKey();
-        uint256 orderId = ILAwareLimitOrderHook(HOOK).createLimitOrder(
-            poolKey,
-            true, // zeroForOne = sell token0 for token1
-            ORDER_AMOUNT,
-            TRIGGER_PRICE
-        );
+        uint256 orderId = ILAwareLimitOrderHook(HOOK)
+            .createLimitOrder(
+                poolKey,
+                true, // zeroForOne = sell token0 for token1
+                ORDER_AMOUNT,
+                TRIGGER_PRICE
+            );
 
         vm.stopBroadcast();
 
@@ -172,10 +173,8 @@ contract ExecuteSwap is SepoliaConfig {
             sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1 // no price limit
         });
 
-        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest.TestSettings({
-            takeClaims: false,
-            settleUsingBurn: false
-        });
+        PoolSwapTest.TestSettings memory testSettings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
         swapRouter.swap(poolKey, swapParams, testSettings, "");
 
@@ -209,25 +208,23 @@ contract CancelOrder is SepoliaConfig {
         // Read order state before cancel
         ILAwareLimitOrderHook hookContract = ILAwareLimitOrderHook(HOOK);
         (
-            address creator,
             uint96 amount0,
-            uint96 amount1,
-            , // token0
+            uint96 amount1,, // token0
             , // token1
-            uint128 triggerPrice,
-            , // createdAt
+            uint128 triggerPrice,, // createdAt
             bool isFilled,
-            bool zeroForOne
+            bool zeroForOne,
+            , // vaultShares
         ) = hookContract.orders(orderId);
 
-        console2.log("Order creator:", creator);
+        console2.log("Order owner:", hookContract.ownerOf(orderId));
         console2.log("Is filled:", isFilled);
         console2.log("zeroForOne:", zeroForOne);
         console2.log("amount0:", uint256(amount0));
         console2.log("amount1:", uint256(amount1));
         console2.log("triggerPrice:", uint256(triggerPrice));
 
-        require(creator == deployer, "Not your order!");
+        require(hookContract.ownerOf(orderId) == deployer, "Not your order!");
         require(!isFilled, "Order already filled!");
 
         vm.startBroadcast(pk);
@@ -264,19 +261,11 @@ contract ReadStatus is SepoliaConfig {
         // Read last few orders
         uint256 start = nextId > 5 ? nextId - 5 : 0;
         for (uint256 i = start; i < nextId; i++) {
-            (
-                address creator,
-                uint96 amount0,
-                uint96 amount1,
-                , ,
-                uint128 triggerPrice,
-                ,
-                bool isFilled,
-                bool zeroForOne
-            ) = hookContract.orders(i);
+            (uint96 amount0, uint96 amount1,,, uint128 triggerPrice,, bool isFilled, bool zeroForOne,,) =
+                hookContract.orders(i);
 
             console2.log("---");
-            console2.log("Order", i, "creator:", creator);
+            console2.log("Order", i, "owner:", hookContract.ownerOf(i));
             console2.log("  filled:", isFilled, "zeroForOne:", zeroForOne);
             console2.log("  amount0:", uint256(amount0), "amount1:", uint256(amount1));
             console2.log("  triggerPrice:", uint256(triggerPrice));
@@ -382,7 +371,8 @@ contract ReadPoolState is SepoliaConfig {
             uint256 count = 0;
             while (cursor != sentinelMax && count < 10) {
                 uint256[] memory idsAtTick = hookContract.getOrdersInTick(cursor);
-                console2.log("  tick:", int256(cursor)); console2.log("    orders:", idsAtTick.length);
+                console2.log("  tick:", int256(cursor));
+                console2.log("    orders:", idsAtTick.length);
                 cursor = hookContract.getNextActiveTick(cursor);
                 count++;
             }
@@ -395,29 +385,20 @@ contract ReadPoolState is SepoliaConfig {
         console2.log("Total orders:", nextId);
 
         for (uint256 i = 0; i < nextId && i < 5; i++) {
-            (
-                address creator,
-                uint96 amount0,
-                ,
-                , ,
-                uint128 triggerPrice,
-                ,
-                bool isFilled,
-                bool zeroForOne
-            ) = hookContract.orders(i);
+            (uint96 amount0,,,, uint128 triggerPrice,, bool isFilled, bool zeroForOne,,) =
+                hookContract.orders(i);
 
             console2.log("");
             console2.log("Order", i);
-            console2.log("  creator:", creator);
+            console2.log("  owner:", hookContract.ownerOf(i));
             console2.log("  filled:", isFilled);
             console2.log("  zeroForOne:", zeroForOne);
             console2.log("  amount0:", uint256(amount0));
             console2.log("  triggerPrice:", uint256(triggerPrice));
 
             if (price_1e18 > 0 && !isFilled) {
-                bool eligible = zeroForOne
-                    ? (price_1e18 >= uint256(triggerPrice))
-                    : (price_1e18 <= uint256(triggerPrice));
+                bool eligible =
+                    zeroForOne ? (price_1e18 >= uint256(triggerPrice)) : (price_1e18 <= uint256(triggerPrice));
                 console2.log("  >>> ELIGIBLE:", eligible);
             }
         }

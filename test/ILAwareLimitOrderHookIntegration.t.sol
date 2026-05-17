@@ -26,10 +26,17 @@ contract MockERC4626 {
     uint256 public yieldBps; // extra yield in BPS (0 = no yield)
     bool public shouldRevert;
 
-    constructor(address _asset) { asset = IERC20(_asset); }
+    constructor(address _asset) {
+        asset = IERC20(_asset);
+    }
 
-    function setYieldBps(uint256 _yieldBps) external { yieldBps = _yieldBps; }
-    function setShouldRevert(bool _shouldRevert) external { shouldRevert = _shouldRevert; }
+    function setYieldBps(uint256 _yieldBps) external {
+        yieldBps = _yieldBps;
+    }
+
+    function setShouldRevert(bool _shouldRevert) external {
+        shouldRevert = _shouldRevert;
+    }
 
     function deposit(uint256 assets, address receiver) external returns (uint256 shares) {
         if (shouldRevert) revert("vault: revert");
@@ -58,22 +65,18 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
     ILAwareLimitOrderHook hook;
     PoolSwapTest swapRouter;
     PoolModifyLiquidityTest modifyLiquidityRouter;
-    
+
     MockERC20 token0;
     MockERC20 token1;
-    
+
     PoolKey poolKey;
-    
+
     address alice = makeAddr("alice");
     address bob = makeAddr("bob");
     address user;
 
     event OrderFilled(
-        uint256 indexed orderId,
-        address indexed creator,
-        uint96 amountIn,
-        uint96 amountOut,
-        uint128 executionPrice
+        uint256 indexed orderId, address indexed creator, uint96 amountIn, uint96 amountOut, uint128 executionPrice
     );
 
     event OrderExecutionFailed(uint256 indexed orderId, string reason);
@@ -88,42 +91,34 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
 
     function setUp() public {
         user = makeAddr("user");
-        
+
         manager = new PoolManager(address(this));
-        
+
         token0 = new MockERC20("Token0", "TK0", 18);
         token1 = new MockERC20("Token1", "TK1", 18);
         if (address(token0) > address(token1)) {
             (token0, token1) = (token1, token0);
         }
-        
+
         // UHI9: all 7 hook flags for ILAwareLimitOrderHook
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG |
-            Hooks.BEFORE_SWAP_FLAG |
-            Hooks.AFTER_SWAP_FLAG |
-            Hooks.AFTER_ADD_LIQUIDITY_FLAG |
-            Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG |
-            Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG |
-            Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
         );
         bytes memory constructorArgs = abi.encode(address(manager), address(this), address(0));
 
         vm.pauseGasMetering();
-        (address predictedAddress, bytes32 salt) = HookMiner.find(
-            address(this),
-            flags,
-            type(ILAwareLimitOrderHook).creationCode,
-            constructorArgs
-        );
+        (address predictedAddress, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, constructorArgs);
 
         hook = new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(0));
         require(address(hook) == predictedAddress, "Hook address mismatch!");
         vm.resumeGasMetering();
-        
+
         swapRouter = new PoolSwapTest(manager);
         modifyLiquidityRouter = new PoolModifyLiquidityTest(manager);
-        
+
         poolKey = PoolKey({
             currency0: Currency.wrap(address(token0)),
             currency1: Currency.wrap(address(token1)),
@@ -131,12 +126,12 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
             tickSpacing: 60,
             hooks: hook
         });
-        
+
         manager.initialize(poolKey, TickMath.getSqrtPriceAtTick(0));
-        
+
         // Add liquidity
         addLiquidity();
-        
+
         // Fund alice
         token0.mint(alice, 100_000e18);
         token1.mint(alice, 100_000e18);
@@ -149,17 +144,14 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
     function addLiquidity() internal {
         token0.mint(address(this), 10_000e18);
         token1.mint(address(this), 10_000e18);
-        
+
         token0.approve(address(modifyLiquidityRouter), type(uint256).max);
         token1.approve(address(modifyLiquidityRouter), type(uint256).max);
-        
+
         modifyLiquidityRouter.modifyLiquidity(
             poolKey,
             IPoolManager.ModifyLiquidityParams({
-                tickLower: -1200,
-                tickUpper: 1200,
-                liquidityDelta: 10_000e18,
-                salt: bytes32(0)
+                tickLower: -1200, tickUpper: 1200, liquidityDelta: 10_000e18, salt: bytes32(0)
             }),
             ""
         );
@@ -172,7 +164,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
     function testCreateOrder() public {
         vm.prank(alice);
         uint256 orderId = hook.createLimitOrder(poolKey, true, 1e18, 1.002e18);
-        
+
         ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
         assertEq(hook.ownerOf(orderId), alice, "ERC721 owner should be alice");
         assertEq(order.amount0, 1e18);
@@ -182,10 +174,10 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
 
     function testCreateOrderTransfersTokens() public {
         uint256 hookToken0Before = token0.balanceOf(address(hook));
-        
+
         vm.prank(alice);
         hook.createLimitOrder(poolKey, true, 1e18, 1.002e18);
-        
+
         assertEq(token0.balanceOf(address(hook)) - hookToken0Before, 1e18);
     }
 
@@ -217,14 +209,14 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
     function testCancelOrderReturnsTokens() public {
         vm.prank(alice);
         uint256 orderId = hook.createLimitOrder(poolKey, true, 1e18, 1.002e18);
-        
+
         uint256 aliceToken0Before = token0.balanceOf(alice);
-        
+
         vm.prank(alice);
         hook.cancelOrder(orderId);
-        
+
         assertEq(token0.balanceOf(alice) - aliceToken0Before, 1e18);
-        
+
         // NFT should be burned after cancel (ownerOf should revert)
         vm.expectRevert();
         hook.ownerOf(orderId);
@@ -233,7 +225,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
     function testUnauthorizedCancellationFails() public {
         vm.prank(alice);
         uint256 orderId = hook.createLimitOrder(poolKey, true, 1e18, 1.002e18);
-        
+
         vm.prank(bob);
         vm.expectRevert(ILAwareLimitOrderHook.NotOrderCreator.selector);
         hook.cancelOrder(orderId);
@@ -247,27 +239,22 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
     function testFullOrderExecution() public {
         uint96 amountIn = 1e18;
         uint128 triggerPrice = 1.002e18;
-        
+
         vm.prank(alice);
         uint256 orderId = hook.createLimitOrder(poolKey, false, amountIn, triggerPrice);
-        
+
         token0.mint(address(this), 50e18);
         token0.approve(address(swapRouter), type(uint256).max);
-        
+
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -50e18,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
-        
+
         ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
         assertTrue(order.isFilled, "Order should be filled");
     }
@@ -276,27 +263,22 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
     function testSellOrderExecution() public {
         uint96 amountIn = 1e18;
         uint128 triggerPrice = 1.002e18;
-        
+
         vm.prank(alice);
         uint256 orderId = hook.createLimitOrder(poolKey, true, amountIn, triggerPrice);
-        
+
         token1.mint(address(this), 50e18);
         token1.approve(address(swapRouter), type(uint256).max);
-        
+
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: false,
-                amountSpecified: -50e18,
-                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+                zeroForOne: false, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
-        
+
         ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
         assertTrue(order.isFilled, "Sell order should be filled");
     }
@@ -305,26 +287,21 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         vm.startPrank(alice);
         hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
         hook.createLimitOrder(poolKey, false, 1e18, 1.005e18);
-        hook.createLimitOrder(poolKey, false, 1e18, 1.010e18);
+        hook.createLimitOrder(poolKey, false, 1e18, 1.01e18);
         vm.stopPrank();
-        
+
         token0.mint(address(this), 100e18);
         token0.approve(address(swapRouter), type(uint256).max);
-        
+
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -100e18,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: -100e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
-        
+
         uint256 filledCount = 0;
         for (uint256 i = 0; i < 3; i++) {
             ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(i);
@@ -339,24 +316,19 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
             hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
         }
         vm.stopPrank();
-        
+
         token0.mint(address(this), 200e18);
         token0.approve(address(swapRouter), type(uint256).max);
-        
+
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -200e18,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: -200e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
-        
+
         uint256 filledCount = 0;
         for (uint256 i = 0; i < 5; i++) {
             ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(i);
@@ -371,21 +343,16 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
             hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
         }
         vm.stopPrank();
-        
+
         token0.mint(address(this), 100e18);
         token0.approve(address(swapRouter), type(uint256).max);
-        
+
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -100e18,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: -100e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
         assertTrue(true, "Gas limit protection prevented OOG revert");
@@ -397,24 +364,19 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         hook.cancelOrder(orderId1);
         uint256 orderId2 = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
         vm.stopPrank();
-        
+
         token0.mint(address(this), 50e18);
         token0.approve(address(swapRouter), type(uint256).max);
-        
+
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -50e18,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
-        
+
         ILAwareLimitOrderHook.LimitOrder memory order2 = hook.getOrder(orderId2);
         assertTrue(order2.isFilled, "Second order should execute after cleanup");
     }
@@ -473,7 +435,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         vm.startPrank(alice);
         hook.createLimitOrder(poolKey, true, 1e18, 1.005e18); // higher price = higher tick
         hook.createLimitOrder(poolKey, true, 1e18, 1.001e18); // lower price = lower tick
-        hook.createLimitOrder(poolKey, true, 1e18, 1.010e18); // highest price
+        hook.createLimitOrder(poolKey, true, 1e18, 1.01e18); // highest price
         vm.stopPrank();
 
         // Walk the list and verify it's sorted ascending
@@ -533,14 +495,9 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -50e18,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
 
@@ -580,9 +537,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -50e18,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
@@ -614,14 +569,9 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -100e18,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: -100e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
 
@@ -675,14 +625,9 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -50e18,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
 
@@ -711,9 +656,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -50e18,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
@@ -756,9 +699,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: false,
-                amountSpecified: -50e18,
-                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+                zeroForOne: false, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
@@ -794,14 +735,9 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -50e18,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
 
@@ -872,14 +808,9 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -50e18,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
 
@@ -900,14 +831,9 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -100e18,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: -100e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
 
@@ -954,9 +880,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         swapRouter.swap(
             poolKey,
             IPoolManager.SwapParams({
-                zeroForOne: false,
-                amountSpecified: -50e18,
-                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+                zeroForOne: false, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
@@ -979,10 +903,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         modifyLiquidityRouter.modifyLiquidity(
             poolKey,
             IPoolManager.ModifyLiquidityParams({
-                tickLower: -600,
-                tickUpper: 600,
-                liquidityDelta: 1000e18,
-                salt: bytes32(0)
+                tickLower: -600, tickUpper: 600, liquidityDelta: 1000e18, salt: bytes32(0)
             }),
             abi.encode(lpAddress)
         );
@@ -1019,7 +940,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         uint128 liq = 1e18;
 
         uint256 sqrtR = (uint256(sqrtPrice) * 1e9) / uint256(sqrtPrice); // 1e9 exactly
-        uint256 diff = sqrtR > 1e9 ? sqrtR - 1e9 : 1e9 - sqrtR;        // 0
+        uint256 diff = sqrtR > 1e9 ? sqrtR - 1e9 : 1e9 - sqrtR; // 0
         uint256 ilAmount = (uint256(liq) * diff * diff) / (2 * 1e9 * 1e9); // 0
 
         assertEq(ilAmount, 0, "IL should be 0 at unchanged price");
@@ -1028,7 +949,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
     /// @notice IL > 0 when price has doubled (sqrt ratio = sqrt(2) ≈ 1.414)
     function test_ILCalculation_PriceDoubled() public pure {
         // sqrtPrice(2) = sqrtPrice(1) * sqrt(2)
-        uint160 sqrtPriceEntry   = 79228162514264337593543950336; // sqrt(1) * 2^96
+        uint160 sqrtPriceEntry = 79228162514264337593543950336; // sqrt(1) * 2^96
         uint160 sqrtPriceCurrent = 112045541949572368435112811072; // sqrt(2) * 2^96 (approx)
         uint128 liq = 1e18;
 
@@ -1051,14 +972,16 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         // (re-use existing hook if vault is address(0) — just test without real vault)
         // Instead: deploy a fresh hook instance pointed at our vault
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG |
-            Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG |
-            Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
         );
         bytes memory args = abi.encode(address(manager), address(this), address(vault));
         vm.pauseGasMetering();
-        (address predicted, bytes32 salt) = HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
-        ILAwareLimitOrderHook hookWithVault = new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
+        (address predicted, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
+        ILAwareLimitOrderHook hookWithVault =
+            new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
         require(address(hookWithVault) == predicted, "mismatch");
         vm.resumeGasMetering();
 
@@ -1077,7 +1000,13 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         token1.mint(address(this), 5_000e18);
         token0.approve(address(modifyLiquidityRouter), type(uint256).max);
         token1.approve(address(modifyLiquidityRouter), type(uint256).max);
-        modifyLiquidityRouter.modifyLiquidity(vaultPoolKey, IPoolManager.ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)}), "");
+        modifyLiquidityRouter.modifyLiquidity(
+            vaultPoolKey,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)
+            }),
+            ""
+        );
 
         // Alice creates a BUY order
         token1.mint(alice, 10e18);
@@ -1090,7 +1019,14 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         // Trigger fill: swap to move price down
         token0.mint(address(this), 50e18);
         token0.approve(address(swapRouter), type(uint256).max);
-        swapRouter.swap(vaultPoolKey, IPoolManager.SwapParams({zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}), PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}), "");
+        swapRouter.swap(
+            vaultPoolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
 
         ILAwareLimitOrderHook.LimitOrder memory order = hookWithVault.getOrder(orderId);
         assertTrue(order.isFilled, "Order must be filled before vault deposit");
@@ -1109,23 +1045,37 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         vault.setYieldBps(100); // 1% yield
 
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG |
-            Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG |
-            Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
         );
         bytes memory args = abi.encode(address(manager), address(this), address(vault));
         vm.pauseGasMetering();
-        (address predicted, bytes32 salt) = HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
-        ILAwareLimitOrderHook hookWithVault = new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
+        (address predicted, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
+        ILAwareLimitOrderHook hookWithVault =
+            new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
         require(address(hookWithVault) == predicted, "mismatch");
         vm.resumeGasMetering();
 
-        PoolKey memory vaultPoolKey = PoolKey({currency0: Currency.wrap(address(token0)), currency1: Currency.wrap(address(token1)), fee: 100, tickSpacing: 1, hooks: hookWithVault});
+        PoolKey memory vaultPoolKey = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 100,
+            tickSpacing: 1,
+            hooks: hookWithVault
+        });
         manager.initialize(vaultPoolKey, TickMath.getSqrtPriceAtTick(0));
 
         token0.mint(address(this), 5_000e18);
         token1.mint(address(this), 5_000e18);
-        modifyLiquidityRouter.modifyLiquidity(vaultPoolKey, IPoolManager.ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)}), "");
+        modifyLiquidityRouter.modifyLiquidity(
+            vaultPoolKey,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)
+            }),
+            ""
+        );
 
         token1.mint(alice, 10e18);
         vm.startPrank(alice);
@@ -1137,7 +1087,14 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         // Fill order
         token0.mint(address(this), 50e18);
         token0.approve(address(swapRouter), type(uint256).max);
-        swapRouter.swap(vaultPoolKey, IPoolManager.SwapParams({zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}), PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}), "");
+        swapRouter.swap(
+            vaultPoolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
 
         // Deposit to vault
         vm.prank(alice);
@@ -1199,7 +1156,9 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         token0.approve(address(swapRouter), type(uint256).max);
         swapRouter.swap(
             poolKey,
-            IPoolManager.SwapParams({zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
@@ -1237,7 +1196,14 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         // Fill order
         token0.mint(address(this), 50e18);
         token0.approve(address(swapRouter), type(uint256).max);
-        swapRouter.swap(poolKey, IPoolManager.SwapParams({zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}), PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}), "");
+        swapRouter.swap(
+            poolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
 
         ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
         assertTrue(order.isFilled, "Order should be filled");

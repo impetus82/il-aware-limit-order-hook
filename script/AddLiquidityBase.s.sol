@@ -39,13 +39,10 @@ contract LiquidityRouter is IUnlockCallback {
         (PoolKey memory poolKey, address payer) = abi.decode(data, (PoolKey, address));
 
         // Add liquidity
-        (BalanceDelta delta, ) = poolManager.modifyLiquidity(
+        (BalanceDelta delta,) = poolManager.modifyLiquidity(
             poolKey,
             IPoolManager.ModifyLiquidityParams({
-                tickLower: TICK_LOWER,
-                tickUpper: TICK_UPPER,
-                liquidityDelta: LIQUIDITY_DELTA,
-                salt: bytes32(0)
+                tickLower: TICK_LOWER, tickUpper: TICK_UPPER, liquidityDelta: LIQUIDITY_DELTA, salt: bytes32(0)
             }),
             ""
         );
@@ -57,17 +54,13 @@ contract LiquidityRouter is IUnlockCallback {
         if (delta.amount0() < 0) {
             uint256 owed0 = uint256(uint128(-delta.amount0()));
             poolManager.sync(poolKey.currency0);
-            IERC20(Currency.unwrap(poolKey.currency0)).transferFrom(
-                payer, address(poolManager), owed0
-            );
+            IERC20(Currency.unwrap(poolKey.currency0)).transferFrom(payer, address(poolManager), owed0);
             poolManager.settle();
         }
         if (delta.amount1() < 0) {
             uint256 owed1 = uint256(uint128(-delta.amount1()));
             poolManager.sync(poolKey.currency1);
-            IERC20(Currency.unwrap(poolKey.currency1)).transferFrom(
-                payer, address(poolManager), owed1
-            );
+            IERC20(Currency.unwrap(poolKey.currency1)).transferFrom(payer, address(poolManager), owed1);
             poolManager.settle();
         }
 
@@ -94,8 +87,7 @@ contract LiquidityRouter is IUnlockCallback {
 ///     --with-gas-price 100000000 -vvvv
 contract AddLiquidityBase is Script {
     // ── Addresses (Base Mainnet) ────────────────────────────
-    IPoolManager constant POOL_MANAGER =
-        IPoolManager(0x498581fF718922c3f8e6A244956aF099B2652b2b);
+    IPoolManager constant POOL_MANAGER = IPoolManager(0x498581fF718922c3f8e6A244956aF099B2652b2b);
 
     address constant WETH = 0x4200000000000000000000000000000000000006;
     address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;

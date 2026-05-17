@@ -38,16 +38,13 @@ contract SwapRouter is IUnlockCallback {
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
         require(msg.sender == address(poolManager), "Only PoolManager");
 
-        (PoolKey memory poolKey, address payer, uint256 amountIn) =
-            abi.decode(data, (PoolKey, address, uint256));
+        (PoolKey memory poolKey, address payer, uint256 amountIn) = abi.decode(data, (PoolKey, address, uint256));
 
         // Swap: sell USDC (token1) for WETH (token0)
         // zeroForOne = false → buying token0 (WETH) with token1 (USDC)
         // amountSpecified < 0 → exact input
         IPoolManager.SwapParams memory swapParams = IPoolManager.SwapParams({
-            zeroForOne: false,
-            amountSpecified: -int256(amountIn),
-            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            zeroForOne: false, amountSpecified: -int256(amountIn), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
         });
 
         poolManager.swap(poolKey, swapParams, "");
@@ -109,8 +106,7 @@ contract TriggerSwapBase is Script {
     using StateLibrary for IPoolManager;
     using PoolIdLibrary for PoolKey;
 
-    IPoolManager constant POOL_MANAGER =
-        IPoolManager(0x498581fF718922c3f8e6A244956aF099B2652b2b);
+    IPoolManager constant POOL_MANAGER = IPoolManager(0x498581fF718922c3f8e6A244956aF099B2652b2b);
 
     address constant WETH = 0x4200000000000000000000000000000000000006;
     address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
@@ -137,7 +133,7 @@ contract TriggerSwapBase is Script {
         });
 
         PoolId poolId = poolKey.toId();
-        (uint160 sqrtPriceBefore, int24 tickBefore, , ) = POOL_MANAGER.getSlot0(poolId);
+        (uint160 sqrtPriceBefore, int24 tickBefore,,) = POOL_MANAGER.getSlot0(poolId);
         uint128 liquidity = POOL_MANAGER.getLiquidity(poolId);
 
         console2.log("Current sqrtPriceX96:", uint256(sqrtPriceBefore));
@@ -164,7 +160,7 @@ contract TriggerSwapBase is Script {
 
         vm.stopBroadcast();
 
-        (uint160 sqrtPriceAfter, int24 tickAfter, , ) = POOL_MANAGER.getSlot0(poolId);
+        (uint160 sqrtPriceAfter, int24 tickAfter,,) = POOL_MANAGER.getSlot0(poolId);
         console2.log("\n=== SWAP EXECUTED ===");
         console2.log("sqrtPriceX96 after:", uint256(sqrtPriceAfter));
         console2.log("tick after:", tickAfter);

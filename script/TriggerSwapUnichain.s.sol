@@ -44,8 +44,7 @@ contract SwapRouterUnichain is IUnlockCallback {
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
         require(msg.sender == address(poolManager), "Only PoolManager");
 
-        (PoolKey memory poolKey, address payer, uint256 amountIn) =
-            abi.decode(data, (PoolKey, address, uint256));
+        (PoolKey memory poolKey, address payer, uint256 amountIn) = abi.decode(data, (PoolKey, address, uint256));
 
         // ═══════════════════════════════════════════════════════════
         // SWAP: Buy WETH (currency1) with USDC (currency0)
@@ -60,9 +59,7 @@ contract SwapRouterUnichain is IUnlockCallback {
         //   = WETH price going UP = what we want to trigger "Sell WETH" orders
         // ═══════════════════════════════════════════════════════════
         IPoolManager.SwapParams memory swapParams = IPoolManager.SwapParams({
-            zeroForOne: true,
-            amountSpecified: -int256(amountIn),
-            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            zeroForOne: true, amountSpecified: -int256(amountIn), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
         });
 
         poolManager.swap(poolKey, swapParams, "");
@@ -129,8 +126,7 @@ contract TriggerSwapUnichain is Script {
     using StateLibrary for IPoolManager;
     using PoolIdLibrary for PoolKey;
 
-    IPoolManager constant POOL_MANAGER =
-        IPoolManager(0x1F98400000000000000000000000000000000004);
+    IPoolManager constant POOL_MANAGER = IPoolManager(0x1F98400000000000000000000000000000000004);
 
     // Unichain: USDC = currency0, WETH = currency1
     address constant USDC = 0x078D782b760474a361dDA0AF3839290b0EF57AD6;
@@ -160,7 +156,7 @@ contract TriggerSwapUnichain is Script {
         });
 
         PoolId poolId = poolKey.toId();
-        (uint160 sqrtPriceBefore, int24 tickBefore, , ) = POOL_MANAGER.getSlot0(poolId);
+        (uint160 sqrtPriceBefore, int24 tickBefore,,) = POOL_MANAGER.getSlot0(poolId);
         uint128 liquidity = POOL_MANAGER.getLiquidity(poolId);
 
         console2.log("Current sqrtPriceX96:", uint256(sqrtPriceBefore));
@@ -187,7 +183,7 @@ contract TriggerSwapUnichain is Script {
 
         vm.stopBroadcast();
 
-        (uint160 sqrtPriceAfter, int24 tickAfter, , ) = POOL_MANAGER.getSlot0(poolId);
+        (uint160 sqrtPriceAfter, int24 tickAfter,,) = POOL_MANAGER.getSlot0(poolId);
         console2.log("\n=== SWAP EXECUTED ===");
         console2.log("sqrtPriceX96 after:", uint256(sqrtPriceAfter));
         console2.log("tick after:", tickAfter);
