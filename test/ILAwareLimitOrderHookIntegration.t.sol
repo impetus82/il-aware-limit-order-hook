@@ -58,8 +58,17 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
             (token0, token1) = (token1, token0);
         }
         
-        // UHI9: afterSwap + afterAddLiquidity + afterAddLiquidityReturnDelta
-        uint160 flags = uint160(Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG);
+        // Flags per CLAUDE.md: afterInitialize, beforeSwap, afterSwap, afterAddLiquidity,
+        // beforeSwapReturnDelta, afterSwapReturnDelta, afterAddLiquidityReturnDelta
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG |
+            Hooks.BEFORE_SWAP_FLAG |
+            Hooks.AFTER_SWAP_FLAG |
+            Hooks.AFTER_ADD_LIQUIDITY_FLAG |
+            Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG |
+            Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG |
+            Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
         bytes memory constructorArgs = abi.encode(address(manager), address(this), address(0));
 
         vm.pauseGasMetering();

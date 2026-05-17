@@ -279,7 +279,6 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Declare which hook callbacks this contract implements
-    /// @dev UHI9: added afterAddLiquidity + afterAddLiquidityReturnDelta for IL tracking
     function getHookPermissions()
         public
         pure
@@ -288,17 +287,17 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     {
         return Hooks.Permissions({
             beforeInitialize: false,
-            afterInitialize: false,
+            afterInitialize: true,
             beforeAddLiquidity: false,
             afterAddLiquidity: true,
             beforeRemoveLiquidity: false,
             afterRemoveLiquidity: false,
-            beforeSwap: false,
+            beforeSwap: true,
             afterSwap: true,
             beforeDonate: false,
             afterDonate: false,
-            beforeSwapReturnDelta: false,
-            afterSwapReturnDelta: false,
+            beforeSwapReturnDelta: true,
+            afterSwapReturnDelta: true,
             afterAddLiquidityReturnDelta: true,
             afterRemoveLiquidityReturnDelta: false
         });
@@ -984,6 +983,28 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /*//////////////////////////////////////////////////////////////
                IL-AWARE HOOK CALLBACKS (UHI9 — stubs)
     //////////////////////////////////////////////////////////////*/
+
+    /// @notice Records sqrtPrice baseline and lastTick at pool initialization
+    function _afterInitialize(
+        address,
+        PoolKey calldata,
+        uint160,
+        int24
+    ) internal override returns (bytes4) {
+        // TODO (Block 1, Day 1): store sqrtPriceBaseline and lastTick[poolId]
+        return this.afterInitialize.selector;
+    }
+
+    /// @notice NoOp execution of limit orders before the AMM swap
+    function _beforeSwap(
+        address,
+        PoolKey calldata,
+        IPoolManager.SwapParams calldata,
+        bytes calldata
+    ) internal override returns (bytes4, BeforeSwapDelta, uint24) {
+        // TODO (Block 1, Day 4): check pending orders; execute P2P via beforeSwapReturnDelta
+        return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+    }
 
     /// @notice Records LP entry price and liquidity when liquidity is added
     /// @dev LP must pass abi.encode(realLP) as hookData; without it IL tracking is skipped (graceful degradation)

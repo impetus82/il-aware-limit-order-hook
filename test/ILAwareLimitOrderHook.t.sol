@@ -60,30 +60,32 @@ contract ILAwareLimitOrderHookTest is Test {
                         HOOK PERMISSIONS TEST
     //////////////////////////////////////////////////////////////*/
     
-    /// @notice UHI9: Verify hook permissions include afterAddLiquidity flags
+    /// @notice Verify hook permissions per CLAUDE.md spec
     function testHookPermissions() public pure {
         Hooks.Permissions memory perms = Hooks.Permissions({
             beforeInitialize: false,
-            afterInitialize: false,
+            afterInitialize: true,
             beforeAddLiquidity: false,
             afterAddLiquidity: true,
             beforeRemoveLiquidity: false,
             afterRemoveLiquidity: false,
-            beforeSwap: false,
+            beforeSwap: true,
             afterSwap: true,
             beforeDonate: false,
             afterDonate: false,
-            beforeSwapReturnDelta: false,
-            afterSwapReturnDelta: false,
+            beforeSwapReturnDelta: true,
+            afterSwapReturnDelta: true,
             afterAddLiquidityReturnDelta: true,
             afterRemoveLiquidityReturnDelta: false
         });
 
+        assertTrue(perms.afterInitialize, "afterInitialize should be enabled");
+        assertTrue(perms.beforeSwap, "beforeSwap should be enabled");
         assertTrue(perms.afterSwap, "afterSwap should be enabled");
         assertTrue(perms.afterAddLiquidity, "afterAddLiquidity should be enabled");
+        assertTrue(perms.beforeSwapReturnDelta, "beforeSwapReturnDelta should be enabled");
+        assertTrue(perms.afterSwapReturnDelta, "afterSwapReturnDelta should be enabled");
         assertTrue(perms.afterAddLiquidityReturnDelta, "afterAddLiquidityReturnDelta should be enabled");
-        assertFalse(perms.beforeSwap, "beforeSwap should be disabled");
-        assertFalse(perms.afterSwapReturnDelta, "afterSwapReturnDelta should be disabled");
     }
 
     function testCompilationSuccess() public pure {
