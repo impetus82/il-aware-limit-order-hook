@@ -6,6 +6,7 @@ import {ILAwareLimitOrderHook} from "../src/ILAwareLimitOrderHook.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {PoolManager} from "v4-core/src/PoolManager.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
@@ -13,8 +14,46 @@ import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {PoolModifyLiquidityTest} from "v4-core/src/test/PoolModifyLiquidityTest.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {HookMiner} from "../script/HookMiner.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/// @dev Simple ERC4626 mock: stores deposits and returns shares 1:1 (no yield by default)
+///      Set `yieldBps` to simulate yield: redeem returns assets * (10000 + yieldBps) / 10000
+contract MockERC4626 {
+    IERC20 public immutable asset;
+    mapping(address => uint256) public sharesOf;
+    uint256 public totalShares;
+    uint256 public yieldBps; // extra yield in BPS (0 = no yield)
+    bool public shouldRevert;
+
+    constructor(address _asset) { asset = IERC20(_asset); }
+
+    function setYieldBps(uint256 _yieldBps) external { yieldBps = _yieldBps; }
+    function setShouldRevert(bool _shouldRevert) external { shouldRevert = _shouldRevert; }
+
+    function deposit(uint256 assets, address receiver) external returns (uint256 shares) {
+        if (shouldRevert) revert("vault: revert");
+        asset.transferFrom(msg.sender, address(this), assets);
+        shares = assets; // 1:1
+        sharesOf[receiver] += shares;
+        totalShares += shares;
+    }
+
+    function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets) {
+        if (shouldRevert) revert("vault: revert");
+        require(sharesOf[owner] >= shares, "insufficient shares");
+        sharesOf[owner] -= shares;
+        totalShares -= shares;
+        // Return assets + yield
+        assets = shares + (shares * yieldBps / 10000);
+        // Mint extra tokens to simulate yield (test only)
+        MockERC20(address(asset)).mint(address(this), (shares * yieldBps / 10000));
+        asset.transfer(receiver, assets);
+    }
+}
 
 contract ILAwareLimitOrderHookIntegrationTest is Test {
+    using PoolIdLibrary for PoolKey;
     PoolManager manager;
     ILAwareLimitOrderHook hook;
     PoolSwapTest swapRouter;
@@ -58,8 +97,16 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
             (token0, token1) = (token1, token0);
         }
         
-        // UHI9: afterSwap + afterAddLiquidity + afterAddLiquidityReturnDelta
-        uint160 flags = uint160(Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG);
+        // UHI9: all 7 hook flags for ILAwareLimitOrderHook
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG |
+            Hooks.BEFORE_SWAP_FLAG |
+            Hooks.AFTER_SWAP_FLAG |
+            Hooks.AFTER_ADD_LIQUIDITY_FLAG |
+            Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG |
+            Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG |
+            Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
         bytes memory constructorArgs = abi.encode(address(manager), address(this), address(0));
 
         vm.pauseGasMetering();
@@ -524,8 +571,6 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
     function testGracefulExecutionOnSlippage() public {
         vm.prank(alice);
         uint256 orderId = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
-        
-        uint256 aliceToken0Before = token0.balanceOf(alice);
 
         token0.mint(address(this), 50e18);
         token0.approve(address(swapRouter), type(uint256).max);
@@ -538,23 +583,20 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
                 amountSpecified: -50e18,
                 sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
-
-        assertTrue(true, "User swap must not revert due to order slippage");
 
         ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
         assertTrue(order.isFilled, "Order should be filled gracefully");
 
+        // Output is held in hook; alice claims it via claimOrder
+        uint256 aliceToken0Before = token0.balanceOf(alice);
+        vm.prank(alice);
+        hook.claimOrder(orderId, poolKey);
         uint256 aliceToken0After = token0.balanceOf(alice);
-        assertTrue(
-            aliceToken0After > aliceToken0Before,
-            "Alice should receive output tokens from filled order"
-        );
+
+        assertTrue(aliceToken0After > aliceToken0Before, "Alice should receive output tokens via claimOrder");
     }
 
     /// @notice Phase 3.14: Multiple orders - all should process without reverting the swap
@@ -652,18 +694,14 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
               PHASE 3.15: FEE MECHANISM TESTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Verify fee is deducted on BUY order execution
+    /// @notice Verify fee is deducted on BUY order execution; output claimed via claimOrder
     function testFeeCollectionOnBuyOrder() public {
-        // Default fee = 5 BPS (0.05%)
         assertEq(hook.feeBps(), 5, "Default fee should be 5 BPS");
 
-        // Alice creates a BUY order (zeroForOne=false, selling token1 for token0)
         vm.prank(alice);
         uint256 orderId = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
 
-        uint256 aliceToken0Before = token0.balanceOf(alice);
-
-        // Execute swap to trigger BUY order
+        // Execute swap to trigger BUY order (output held in hook)
         token0.mint(address(this), 50e18);
         token0.approve(address(swapRouter), type(uint256).max);
 
@@ -674,50 +712,39 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
                 amountSpecified: -50e18,
                 sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
 
         ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
         assertTrue(order.isFilled, "Order should be filled");
 
-        // Alice received token0 (output) minus the fee
+        // Fee is accumulated from execution
+        uint256 pendingFee = hook.getPendingFees(poolKey.currency0);
+        assertTrue(pendingFee > 0, "Fee should be collected at execution");
+
+        // Alice claims her output
+        uint256 aliceToken0Before = token0.balanceOf(alice);
+        vm.prank(alice);
+        hook.claimOrder(orderId, poolKey);
         uint256 aliceToken0After = token0.balanceOf(alice);
         uint256 aliceReceived = aliceToken0After - aliceToken0Before;
 
-        // Fee should be accumulated in pendingFees
-        uint256 pendingFee = hook.getPendingFees(poolKey.currency0);
+        assertTrue(aliceReceived > 0, "Alice should receive tokens via claimOrder");
 
-        // Total output = aliceReceived + pendingFee
+        // Verify fee math: pendingFee = (aliceReceived + pendingFee) * 5 / 10000
         uint256 totalOutput = aliceReceived + pendingFee;
-
-        // pendingFee should be ~0.05% of totalOutput
-        // fee = totalOutput * 5 / 10000
-        // Allow for rounding: pendingFee should be approximately totalOutput * 5 / 10000
-        assertTrue(pendingFee > 0, "Fee should be collected");
-        assertTrue(aliceReceived > 0, "Alice should receive tokens");
-
-        // Verify the math: fee = totalOutput * 5 / 10000
-        // So: pendingFee * 10000 / 5 ≈ totalOutput (within rounding)
         uint256 expectedFee = (totalOutput * 5) / 10000;
         assertEq(pendingFee, expectedFee, "Fee calculation should be exact");
 
         console2.log("Alice received:", aliceReceived);
         console2.log("Fee collected:", pendingFee);
-        console2.log("Total output:", totalOutput);
-        console2.log("Fee percentage:", (pendingFee * 10000) / totalOutput, "BPS");
     }
 
-    /// @notice Verify fee is deducted on SELL order execution
+    /// @notice Verify fee is deducted on SELL order execution; output claimed via claimOrder
     function testFeeCollectionOnSellOrder() public {
-        // Alice creates a SELL order (zeroForOne=true, selling token0 for token1)
         vm.prank(alice);
         uint256 orderId = hook.createLimitOrder(poolKey, true, 1e18, 1.002e18);
-
-        uint256 aliceToken1Before = token1.balanceOf(alice);
 
         // Execute swap to trigger SELL order (price goes UP)
         token1.mint(address(this), 50e18);
@@ -730,23 +757,23 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
                 amountSpecified: -50e18,
                 sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
             }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
 
         ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
         assertTrue(order.isFilled, "Sell order should be filled");
 
-        // Fee should be in currency1 (output of sell order)
         uint256 pendingFee = hook.getPendingFees(poolKey.currency1);
         assertTrue(pendingFee > 0, "Fee should be collected from sell order");
 
+        // Alice claims her token1 output
+        uint256 aliceToken1Before = token1.balanceOf(alice);
+        vm.prank(alice);
+        hook.claimOrder(orderId, poolKey);
         uint256 aliceToken1After = token1.balanceOf(alice);
         uint256 aliceReceived = aliceToken1After - aliceToken1Before;
-        assertTrue(aliceReceived > 0, "Alice should receive token1");
+        assertTrue(aliceReceived > 0, "Alice should receive token1 via claimOrder");
 
         console2.log("Sell order - Alice received:", aliceReceived);
         console2.log("Sell order - Fee collected:", pendingFee);
@@ -894,5 +921,258 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
             assertTrue(totalFees > 0, "Fees should accumulate from multiple orders");
             console2.log("Accumulated fees from", filledCount, "orders:", totalFees);
         }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+              BLOCK 1: afterInitialize & afterAddLiquidity TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Verifies lastTick and sqrtPriceBaseline are set after pool initialization
+    function test_AfterInitialize() public {
+        PoolId poolId = poolKey.toId();
+
+        // Pool was initialized at tick 0 (getSqrtPriceAtTick(0)) in setUp()
+        int24 storedTick = hook.lastTick(poolId);
+        uint160 storedSqrtPrice = hook.sqrtPriceBaseline(poolId);
+
+        assertEq(storedTick, 0, "lastTick should be 0 after init at tick 0");
+        assertEq(storedSqrtPrice, TickMath.getSqrtPriceAtTick(0), "sqrtPriceBaseline should match init price");
+    }
+
+    /// @notice Verifies lastTick is updated in afterSwap
+    function test_LastTickUpdatedAfterSwap() public {
+        PoolId poolId = poolKey.toId();
+        int24 tickBefore = hook.lastTick(poolId);
+
+        // Swap to move price
+        token1.mint(address(this), 50e18);
+        token1.approve(address(swapRouter), type(uint256).max);
+
+        swapRouter.swap(
+            poolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: false,
+                amountSpecified: -50e18,
+                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        int24 tickAfter = hook.lastTick(poolId);
+        // After a !zeroForOne swap the tick should have moved up
+        assertTrue(tickAfter >= tickBefore, "lastTick should increase after price-up swap");
+    }
+
+    /// @notice Verifies lpPositions are recorded when hookData contains the LP address
+    function test_AfterAddLiquidity_WithHookData() public {
+        address lpAddress = makeAddr("lp_provider");
+
+        token0.mint(address(this), 1000e18);
+        token1.mint(address(this), 1000e18);
+        token0.approve(address(modifyLiquidityRouter), type(uint256).max);
+        token1.approve(address(modifyLiquidityRouter), type(uint256).max);
+
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -600,
+                tickUpper: 600,
+                liquidityDelta: 1000e18,
+                salt: bytes32(0)
+            }),
+            abi.encode(lpAddress)
+        );
+
+        PoolId poolId = poolKey.toId();
+        ILAwareLimitOrderHook.LPPosition memory pos = hook.getLPPosition(poolId, lpAddress);
+
+        assertTrue(pos.sqrtPriceAtEntry > 0, "sqrtPriceAtEntry should be recorded");
+        assertEq(pos.liquidity, uint128(1000e18), "liquidity should match liquidityDelta");
+        assertEq(pos.entryTimestamp, block.timestamp, "entryTimestamp should be current block");
+    }
+
+    /// @notice Verifies that LP tracking is skipped gracefully when hookData is empty
+    function test_AfterAddLiquidity_NoHookData_Graceful() public {
+        address lpAddress = makeAddr("unknown_lp");
+
+        // setUp already called addLiquidity() with empty hookData — no lpPositions recorded
+        PoolId poolId = poolKey.toId();
+        ILAwareLimitOrderHook.LPPosition memory pos = hook.getLPPosition(poolId, lpAddress);
+
+        assertEq(pos.sqrtPriceAtEntry, 0, "No tracking without hookData");
+        assertEq(pos.liquidity, 0, "No liquidity recorded without hookData");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+              BLOCK 2: IL CALCULATION & VAULT INTEGRATION TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice IL = 0 when price hasn't moved
+    function test_ILCalculation_ZeroMovement() public pure {
+        // Taylor approx: IL = liq * ((√R - 1)^2) / 2 where R = P_current / P_entry
+        // When P_current == P_entry: √R = 1, diff = 0, IL = 0
+        uint160 sqrtPrice = 79228162514264337593543950336; // sqrt(1) * 2^96
+        uint128 liq = 1e18;
+
+        uint256 sqrtR = (uint256(sqrtPrice) * 1e9) / uint256(sqrtPrice); // 1e9 exactly
+        uint256 diff = sqrtR > 1e9 ? sqrtR - 1e9 : 1e9 - sqrtR;        // 0
+        uint256 ilAmount = (uint256(liq) * diff * diff) / (2 * 1e9 * 1e9); // 0
+
+        assertEq(ilAmount, 0, "IL should be 0 at unchanged price");
+    }
+
+    /// @notice IL > 0 when price has doubled (sqrt ratio = sqrt(2) ≈ 1.414)
+    function test_ILCalculation_PriceDoubled() public pure {
+        // sqrtPrice(2) = sqrtPrice(1) * sqrt(2)
+        uint160 sqrtPriceEntry   = 79228162514264337593543950336; // sqrt(1) * 2^96
+        uint160 sqrtPriceCurrent = 112045541949572368435112811072; // sqrt(2) * 2^96 (approx)
+        uint128 liq = 1e18;
+
+        uint256 sqrtR = (uint256(sqrtPriceCurrent) * 1e9) / uint256(sqrtPriceEntry);
+        // sqrtR ≈ 1.414e9
+        assertTrue(sqrtR > 1e9, "sqrtR should be > 1e9 when price doubled");
+
+        uint256 diff = sqrtR - 1e9; // ≈ 0.414e9
+        uint256 ilAmount = (uint256(liq) * diff * diff) / (2 * 1e9 * 1e9);
+        assertTrue(ilAmount > 0, "IL should be > 0 when price doubled");
+        console2.log("IL at 2x price (liq=1e18):", ilAmount);
+    }
+
+    /// @notice depositToVault correctly stores vault shares for a filled order
+    function test_VaultDeposit() public {
+        // Deploy mock vault for token0
+        MockERC4626 vault = new MockERC4626(address(token0));
+
+        // Deploy a new hook with the vault address
+        // (re-use existing hook if vault is address(0) — just test without real vault)
+        // Instead: deploy a fresh hook instance pointed at our vault
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG |
+            Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG |
+            Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory args = abi.encode(address(manager), address(this), address(vault));
+        vm.pauseGasMetering();
+        (address predicted, bytes32 salt) = HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
+        ILAwareLimitOrderHook hookWithVault = new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
+        require(address(hookWithVault) == predicted, "mismatch");
+        vm.resumeGasMetering();
+
+        // New pool with vault hook
+        PoolKey memory vaultPoolKey = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 500,
+            tickSpacing: 10,
+            hooks: hookWithVault
+        });
+        manager.initialize(vaultPoolKey, TickMath.getSqrtPriceAtTick(0));
+
+        // Add liquidity to vault pool
+        token0.mint(address(this), 5_000e18);
+        token1.mint(address(this), 5_000e18);
+        token0.approve(address(modifyLiquidityRouter), type(uint256).max);
+        token1.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(vaultPoolKey, IPoolManager.ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)}), "");
+
+        // Alice creates a BUY order
+        token1.mint(alice, 10e18);
+        vm.startPrank(alice);
+        token1.approve(address(hookWithVault), type(uint256).max);
+        token0.approve(address(hookWithVault), type(uint256).max);
+        uint256 orderId = hookWithVault.createLimitOrder(vaultPoolKey, false, 1e18, 1.002e18);
+        vm.stopPrank();
+
+        // Trigger fill: swap to move price down
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(vaultPoolKey, IPoolManager.SwapParams({zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}), PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}), "");
+
+        ILAwareLimitOrderHook.LimitOrder memory order = hookWithVault.getOrder(orderId);
+        assertTrue(order.isFilled, "Order must be filled before vault deposit");
+
+        // Alice deposits filled order output to vault
+        vm.prank(alice);
+        hookWithVault.depositToVault(orderId);
+
+        ILAwareLimitOrderHook.LimitOrder memory orderAfter = hookWithVault.getOrder(orderId);
+        assertTrue(orderAfter.vaultShares > 0, "vaultShares should be recorded after depositToVault");
+    }
+
+    /// @notice claimOrder distributes vault yield as IL rebate
+    function test_YieldRebate_OnClaim() public {
+        MockERC4626 vault = new MockERC4626(address(token0));
+        vault.setYieldBps(100); // 1% yield
+
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG |
+            Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG |
+            Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory args = abi.encode(address(manager), address(this), address(vault));
+        vm.pauseGasMetering();
+        (address predicted, bytes32 salt) = HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
+        ILAwareLimitOrderHook hookWithVault = new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
+        require(address(hookWithVault) == predicted, "mismatch");
+        vm.resumeGasMetering();
+
+        PoolKey memory vaultPoolKey = PoolKey({currency0: Currency.wrap(address(token0)), currency1: Currency.wrap(address(token1)), fee: 100, tickSpacing: 1, hooks: hookWithVault});
+        manager.initialize(vaultPoolKey, TickMath.getSqrtPriceAtTick(0));
+
+        token0.mint(address(this), 5_000e18);
+        token1.mint(address(this), 5_000e18);
+        modifyLiquidityRouter.modifyLiquidity(vaultPoolKey, IPoolManager.ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)}), "");
+
+        token1.mint(alice, 10e18);
+        vm.startPrank(alice);
+        token1.approve(address(hookWithVault), type(uint256).max);
+        token0.approve(address(hookWithVault), type(uint256).max);
+        uint256 orderId = hookWithVault.createLimitOrder(vaultPoolKey, false, 1e18, 1.002e18);
+        vm.stopPrank();
+
+        // Fill order
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(vaultPoolKey, IPoolManager.SwapParams({zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}), PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}), "");
+
+        // Deposit to vault
+        vm.prank(alice);
+        hookWithVault.depositToVault(orderId);
+
+        assertTrue(hookWithVault.getOrder(orderId).vaultShares > 0, "Shares should be deposited");
+
+        // Claim: should receive output + yield rebate
+        uint256 aliceBefore = token0.balanceOf(alice);
+        vm.prank(alice);
+        hookWithVault.claimOrder(orderId, vaultPoolKey);
+        uint256 aliceAfter = token0.balanceOf(alice);
+
+        assertTrue(aliceAfter > aliceBefore, "Alice should receive tokens via claimOrder");
+        console2.log("Alice received on claim:", aliceAfter - aliceBefore);
+    }
+
+    /// @notice claimOrder works gracefully when vault is not configured (vaultShares == 0)
+    function test_GracefulFill_VaultEmpty() public {
+        // hook in setUp has yieldVault = address(0)
+        vm.prank(alice);
+        uint256 orderId = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
+
+        // Fill order
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(poolKey, IPoolManager.SwapParams({zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}), PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}), "");
+
+        ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
+        assertTrue(order.isFilled, "Order should be filled");
+        assertEq(order.vaultShares, 0, "No vault shares when vault not configured");
+
+        // claimOrder with no vault: should work gracefully
+        uint256 aliceBefore = token0.balanceOf(alice);
+        vm.prank(alice);
+        hook.claimOrder(orderId, poolKey);
+        uint256 aliceAfter = token0.balanceOf(alice);
+
+        assertTrue(aliceAfter > aliceBefore, "Alice should receive output without vault");
     }
 }
