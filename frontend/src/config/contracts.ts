@@ -72,10 +72,11 @@ const CHAIN_CONTRACTS: Record<number, ChainContracts> = {
   },
 
   // ── Unichain Mainnet (130) ──────────────────────────
-  // Deployed via script/DeployHookathon.s.sol on 2026-05-18
-  // tx: 0x543e6ade80cfa857df08527550d19748db30495751375f08e28f13db7f7e4ddf
+  // Redeployed via script/DeployHookathon.s.sol on 2026-05-19
+  // SimulatedYieldVault: 0xceee912C708516624E9aC5581c8FCC93eA8eE79d
+  // Pool init tx: 0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a4
   130: {
-    hook: "0x3BBB0d16E44A1a7be9e6268591656d82F7B554CE",
+    hook: "0x8C19f1641946c662308000bB4E2Eaf684c81d4CE",
     stateView: "0x86e8631a016f9068c3f085faf484ee3f5fdee8f2",
     poolManager: "0x1F98400000000000000000000000000000000004",
     weth: {
@@ -90,7 +91,7 @@ const CHAIN_CONTRACTS: Record<number, ChainContracts> = {
       name: "USD Coin",
       decimals: 6,
     },
-    poolId: "0xe7e90f68f0a7ac610e742357321169767b9dc97c3d7ae84deae63195ff8c7446",
+    poolId: "0xe1d695d4c147091549aeb6f9e78521a0184a1e7e272a71c12e708c881981f6ba",
     explorerUrl: "https://uniscan.xyz",
     chainLabel: "UNICHAIN",
     wethIsCurrency0: false,

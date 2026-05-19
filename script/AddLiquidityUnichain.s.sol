@@ -99,7 +99,7 @@ contract AddLiquidityUnichain is Script {
     // Unichain: USDC sorts before WETH → currency0 = USDC, currency1 = WETH
     address constant USDC = 0x078D782b760474a361dDA0AF3839290b0EF57AD6;
     address constant WETH = 0x4200000000000000000000000000000000000006;
-    address constant HOOK = 0x3BBB0d16E44A1a7be9e6268591656d82F7B554CE;
+    address constant HOOK = 0x8C19f1641946c662308000bB4E2Eaf684c81d4CE; // Phase 6.19 redeploy (SimulatedYieldVault)
 
     // ── Pool parameters (must match pool initialization) ────
     uint24 constant POOL_FEE = 3000; // 0.30% — matches pool initialized via DeployHookathon.s.sol
