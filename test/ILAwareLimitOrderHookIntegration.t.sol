@@ -17,6 +17,74 @@ import {HookMiner} from "../script/HookMiner.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  SimulatedYieldVault — same logic as script/DeployHookathon.s.sol
+//  Simulates 3% APY using block.timestamp; mints yield deficit via MockERC20.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// @title  SimulatedYieldVault (test copy)
+/// @notice Mirrors the production SimulatedYieldVault in DeployHookathon.s.sol.
+///         Yield formula (simple interest):
+///           assets = shares + shares * APY_BPS * elapsed / (10_000 * 365 days)
+///         Yield deficit is minted on-demand via MockERC20.mint — no manual top-up needed.
+contract SimulatedYieldVault {
+    IERC20 public immutable asset;
+    mapping(address => uint256) public sharesOf;
+    uint256 public totalShares;
+
+    uint256 public constant APY_BPS = 300; // 3% per year
+    uint256 public immutable startTime;
+
+    constructor(address _asset) {
+        asset = IERC20(_asset);
+        startTime = block.timestamp;
+    }
+
+    function deposit(uint256 assets, address receiver) external returns (uint256 shares) {
+        asset.transferFrom(msg.sender, address(this), assets);
+        shares = assets;
+        sharesOf[receiver] += shares;
+        totalShares += shares;
+    }
+
+    function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets) {
+        require(sharesOf[owner] >= shares, "SimulatedYieldVault: insufficient shares");
+        sharesOf[owner] -= shares;
+        totalShares -= shares;
+        uint256 simulated = previewRedeem(shares);
+        uint256 balance = asset.balanceOf(address(this));
+        if (simulated > balance) {
+            uint256 deficit = simulated - balance;
+            (bool ok,) = address(asset).call(
+                abi.encodeWithSignature("mint(address,uint256)", address(this), deficit)
+            );
+            assets = ok ? simulated : balance;
+        } else {
+            assets = simulated;
+        }
+        asset.transfer(receiver, assets);
+    }
+
+    /// @notice Principal + simple-interest APY since vault deployment
+    function previewRedeem(uint256 shares) public view returns (uint256) {
+        uint256 elapsed = block.timestamp - startTime;
+        uint256 yieldAmt = (shares * APY_BPS * elapsed) / (10_000 * 365 days);
+        return shares + yieldAmt;
+    }
+
+    function totalAssets() external view returns (uint256) { return previewRedeem(totalShares); }
+    function convertToAssets(uint256 shares) external view returns (uint256) { return previewRedeem(shares); }
+    function convertToShares(uint256 assets) external pure returns (uint256) { return assets; }
+    function previewDeposit(uint256 assets) external pure returns (uint256) { return assets; }
+    function previewMint(uint256 shares) external pure returns (uint256) { return shares; }
+    function maxDeposit(address) external pure returns (uint256) { return type(uint256).max; }
+    function maxMint(address) external pure returns (uint256)    { return type(uint256).max; }
+    function maxRedeem(address owner) external view returns (uint256) { return sharesOf[owner]; }
+    function maxWithdraw(address owner) external view returns (uint256) { return previewRedeem(sharesOf[owner]); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// @dev Simple ERC4626 mock: stores deposits and returns shares 1:1 (no yield by default)
 ///      Set `yieldBps` to simulate yield: redeem returns assets * (10000 + yieldBps) / 10000
 contract MockERC4626 {
@@ -1185,6 +1253,135 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         // NFT is burned after claim
         vm.expectRevert();
         hook.ownerOf(orderId);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+              PHASE 6.18: TIME-BASED YIELD SIMULATION TEST
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Phase 6.18: SimulatedYieldVault generates real yield after vm.warp.
+    ///         Full flow:
+    ///           1. Deploy SimulatedYieldVault (startTime = now)
+    ///           2. Create + fill limit order, deposit output to vault
+    ///           3. vm.warp +30 days  →  vault accrues ~2.5% APY
+    ///           4. claimOrder        →  hook redeems vault, applies IL rebate
+    ///           5. Assert aliceReceived > outputAmount (yield covered part of IL)
+    function test_YieldRebate_WithTimeSimulation() public {
+        // ── 1. Deploy SimulatedYieldVault (3% APY, startTime = block.timestamp) ──
+        SimulatedYieldVault vault = new SimulatedYieldVault(address(token0));
+
+        // ── 2. Deploy fresh hook pointing at the vault ─────────────────────────
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory args = abi.encode(address(manager), address(this), address(vault));
+        vm.pauseGasMetering();
+        (address predicted, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
+        ILAwareLimitOrderHook hookWithVault =
+            new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
+        require(address(hookWithVault) == predicted, "hook address mismatch");
+        vm.resumeGasMetering();
+
+        // ── 3. Initialize pool with vault hook (unique fee=100 / tickSpacing=1) ──
+        PoolKey memory vaultPoolKey = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 100,
+            tickSpacing: 1,
+            hooks: hookWithVault
+        });
+        manager.initialize(vaultPoolKey, TickMath.getSqrtPriceAtTick(0));
+
+        // ── 4. Add liquidity so swaps can execute ─────────────────────────────
+        token0.mint(address(this), 5_000e18);
+        token1.mint(address(this), 5_000e18);
+        token0.approve(address(modifyLiquidityRouter), type(uint256).max);
+        token1.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            vaultPoolKey,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)
+            }),
+            ""
+        );
+
+        // ── 5. Alice creates a BUY order (zeroForOne=false: input=token1, output=token0) ──
+        token1.mint(alice, 10e18);
+        vm.startPrank(alice);
+        token1.approve(address(hookWithVault), type(uint256).max);
+        token0.approve(address(hookWithVault), type(uint256).max);
+        uint256 orderId = hookWithVault.createLimitOrder(vaultPoolKey, false, 1e18, 1.002e18);
+        vm.stopPrank();
+
+        // ── 6. Trigger fill: swap LARGE zeroForOne=true to move price past trigger ──
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            vaultPoolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        ILAwareLimitOrderHook.LimitOrder memory orderAfterFill = hookWithVault.getOrder(orderId);
+        assertTrue(orderAfterFill.isFilled, "Order must be filled before vault deposit");
+
+        // Record output amount stored in the order (token0, after protocol fee)
+        uint256 outputAmount = uint256(orderAfterFill.amount0);
+        assertTrue(outputAmount > 0, "Output (token0) must be non-zero");
+
+        // ── 7. Alice deposits filled output to vault ─────────────────────────
+        vm.prank(alice);
+        hookWithVault.depositToVault(orderId);
+
+        uint256 vaultShares = hookWithVault.getOrder(orderId).vaultShares;
+        assertTrue(vaultShares > 0, "vaultShares must be recorded after depositToVault");
+        assertEq(vaultShares, outputAmount, "1:1 deposit: shares == outputAmount");
+
+        // ── 8. Fast-forward 30 days — vault accrues ~2.47% APY ──────────────
+        vm.warp(block.timestamp + 30 days);
+
+        // Verify vault now reports yield
+        uint256 previewedAssets = vault.previewRedeem(vaultShares);
+        assertGt(previewedAssets, vaultShares, "Vault should report yield after 30 days");
+        uint256 expectedYield = previewedAssets - vaultShares;
+
+        console2.log("=== Phase 6.18: SimulatedYieldVault Time Test ===");
+        console2.log("outputAmount (token0 in order):", outputAmount);
+        console2.log("vaultShares:                   ", vaultShares);
+        console2.log("previewRedeem after 30d:       ", previewedAssets);
+        console2.log("expectedYield (30d @ 3% APY):  ", expectedYield);
+
+        // ── 9. Claim order: hook redeems vault, applies IL rebate ────────────
+        uint256 aliceBefore = token0.balanceOf(alice);
+        vm.prank(alice);
+        hookWithVault.claimOrder(orderId, vaultPoolKey);
+        uint256 aliceReceived = token0.balanceOf(alice) - aliceBefore;
+
+        console2.log("aliceReceived (token0):        ", aliceReceived);
+        console2.log("rebate applied:                ",
+            aliceReceived > outputAmount ? aliceReceived - outputAmount : 0);
+
+        // ── 10. Assertions ──────────────────────────────────────────────────
+        // Alice received tokens
+        assertGt(aliceReceived, 0, "Alice should receive token0 from claimOrder");
+
+        // Vault generated positive yield after 30 days
+        assertGt(expectedYield, 0, "Yield must be positive after 30 days at 3% APY");
+
+        // Alice received more than the stored output amount (yield rebate applied)
+        // rebate = min(yield, IL); IL > 0 because price moved during the fill swap
+        assertGt(aliceReceived, outputAmount,
+            "Alice should receive outputAmount + IL-rebate (yield covered impermanent loss)");
+
+        // NFT burned after claim
+        vm.expectRevert();
+        hookWithVault.ownerOf(orderId);
     }
 
     /// @notice claimOrder works gracefully when vault is not configured (vaultShares == 0)

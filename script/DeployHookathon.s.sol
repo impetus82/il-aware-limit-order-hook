@@ -9,41 +9,133 @@ import {ILAwareLimitOrderHook} from "../src/ILAwareLimitOrderHook.sol";
 import {HookMiner} from "./HookMiner.sol";
 
 // ============================================================
-//  MOCK YIELD VAULT (Hookathon testnet only)
+//  SIMULATED YIELD VAULT (Hookathon Demo Day)
 // ============================================================
 
-/// @notice Minimal ERC-4626 compatible vault for Hookathon demonstration.
-///         Stores deposited assets and returns them on redeem — yield
-///         can be seeded manually by sending extra tokens to the vault.
-contract MockYieldVault {
+/// @title  SimulatedYieldVault
+/// @notice ERC-4626 compatible vault that simulates time-based APY accumulation.
+///
+///         Motivation: Aave / Morpho are not yet deployed on Unichain Mainnet at
+///         Hookathon time, so real yield is unavailable. This vault produces
+///         deterministic, auditable yield for Demo Day using block.timestamp.
+///
+/// Yield formula (simple interest, accrues since vault deployment):
+///
+///   assets = shares + shares * APY_BPS * elapsed / (10_000 * 365 days)
+///
+/// Where:
+///   APY_BPS = 300  (3% per year)
+///   elapsed = block.timestamp - startTime
+///
+/// Mint-on-demand for tests:
+///   If the vault's token balance is insufficient to cover the simulated yield,
+///   it attempts a low-level `mint(address,uint256)` call on the asset contract
+///   (succeeds in test environments with MockERC20; no-op with real WETH).
+///   In production, the vault owner should top up with extra WETH to fund yield.
+contract SimulatedYieldVault {
     IERC20 public immutable asset;
     mapping(address => uint256) public sharesOf;
+    uint256 public totalShares;
+
+    /// @dev 3% APY expressed in basis points
+    uint256 public constant APY_BPS = 300;
+    /// @dev Timestamp at vault deployment; yield accrues from this point
+    uint256 public immutable startTime;
 
     constructor(address _asset) {
         asset = IERC20(_asset);
+        startTime = block.timestamp;
     }
 
-    /// @notice Deposit assets, receive 1:1 shares
+    // ── Core ERC-4626: deposit / redeem ─────────────────────────────────────
+
+    /// @notice Deposit `assets`, receive 1:1 shares
     function deposit(uint256 assets, address receiver) external returns (uint256 shares) {
         asset.transferFrom(msg.sender, address(this), assets);
         shares = assets;
         sharesOf[receiver] += shares;
+        totalShares += shares;
     }
 
-    /// @notice Redeem shares for assets (any yield from manual top-up is included)
+    /// @notice Redeem `shares` for principal + simulated APY yield
+    /// @dev In test environments the yield deficit is minted; in production it
+    ///      is capped to the vault's actual WETH balance.
     function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets) {
-        require(sharesOf[owner] >= shares, "MockYieldVault: insufficient shares");
+        require(sharesOf[owner] >= shares, "SimulatedYieldVault: insufficient shares");
         sharesOf[owner] -= shares;
-        // Pro-rata: assets = shares * vaultBalance / totalShares
-        // Simplified: 1:1 + any surplus sitting in the vault
-        uint256 vaultBalance = asset.balanceOf(address(this));
-        assets = shares <= vaultBalance ? shares : vaultBalance;
+        totalShares -= shares;
+
+        uint256 simulated = previewRedeem(shares);
+        uint256 balance = asset.balanceOf(address(this));
+
+        if (simulated > balance) {
+            // Attempt to mint yield deficit (works with MockERC20 in test environments)
+            uint256 deficit = simulated - balance;
+            (bool ok,) = address(asset).call(
+                abi.encodeWithSignature("mint(address,uint256)", address(this), deficit)
+            );
+            assets = ok ? simulated : balance; // graceful fallback in production
+        } else {
+            assets = simulated;
+        }
         asset.transfer(receiver, assets);
     }
 
-    /// @notice ERC-4626 minimal metadata
+    // ── ERC-4626: preview / view ─────────────────────────────────────────────
+
+    /// @notice Principal + simple-interest APY since vault deployment
+    function previewRedeem(uint256 shares) public view returns (uint256) {
+        uint256 elapsed = block.timestamp - startTime;
+        uint256 yieldAmt = (shares * APY_BPS * elapsed) / (10_000 * 365 days);
+        return shares + yieldAmt;
+    }
+
     function totalAssets() external view returns (uint256) {
-        return asset.balanceOf(address(this));
+        return previewRedeem(totalShares);
+    }
+
+    function convertToAssets(uint256 shares) external view returns (uint256) {
+        return previewRedeem(shares);
+    }
+
+    function convertToShares(uint256 assets) external pure returns (uint256) {
+        return assets; // 1:1 entry ratio
+    }
+
+    function previewDeposit(uint256 assets) external pure returns (uint256) {
+        return assets;
+    }
+
+    function previewMint(uint256 shares) external pure returns (uint256) {
+        return shares;
+    }
+
+    function previewWithdraw(uint256 assets) external view returns (uint256 shares) {
+        uint256 elapsed = block.timestamp - startTime;
+        uint256 denom = 10_000 * 365 days + APY_BPS * elapsed;
+        shares = (assets * (10_000 * 365 days)) / denom;
+    }
+
+    function maxDeposit(address) external pure returns (uint256) { return type(uint256).max; }
+    function maxMint(address) external pure returns (uint256)    { return type(uint256).max; }
+    function maxRedeem(address owner) external view returns (uint256) { return sharesOf[owner]; }
+    function maxWithdraw(address owner) external view returns (uint256) {
+        return previewRedeem(sharesOf[owner]);
+    }
+
+    function mint(uint256 shares, address receiver) external returns (uint256 assets) {
+        assets = shares;
+        asset.transferFrom(msg.sender, address(this), assets);
+        sharesOf[receiver] += shares;
+        totalShares += shares;
+    }
+
+    function withdraw(uint256 assets, address receiver, address owner) external returns (uint256 shares) {
+        shares = assets;
+        require(sharesOf[owner] >= shares, "SimulatedYieldVault: insufficient shares");
+        sharesOf[owner] -= shares;
+        totalShares -= shares;
+        asset.transfer(receiver, assets);
     }
 }
 
@@ -106,12 +198,14 @@ contract DeployHookathon is Script {
         console2.log("Vault asset:  ", vaultAsset);
         console2.log("Hook flags:   ", FLAGS);
 
-        // ── Step 1: Deploy MockYieldVault ─────────────────────
+        // ── Step 1: Deploy SimulatedYieldVault ───────────────
         vm.startBroadcast(deployerPk);
-        MockYieldVault vault = new MockYieldVault(vaultAsset);
+        SimulatedYieldVault vault = new SimulatedYieldVault(vaultAsset);
         vm.stopBroadcast();
 
-        console2.log("\n[1] MockYieldVault deployed at:", address(vault));
+        console2.log("\n[1] SimulatedYieldVault deployed at:", address(vault));
+        console2.log("     APY_BPS:", vault.APY_BPS(), "(3% per year)");
+        console2.log("     startTime:", vault.startTime());
 
         // ── Step 2: Mine CREATE2 salt for hook address ────────
         //    HookMiner runs in simulation (pure library) — no broadcast needed.
@@ -145,7 +239,7 @@ contract DeployHookathon is Script {
         console2.log("\n========================================");
         console2.log("=== DEPLOYMENT COMPLETE ===");
         console2.log("========================================");
-        console2.log("MockYieldVault: ", address(vault));
+        console2.log("SimulatedYieldVault:", address(vault));
         console2.log("Hook address:   ", address(hook));
         console2.log("Hook owner:     ", hook.owner());
         console2.log("yieldVault:     ", hook.yieldVault());
