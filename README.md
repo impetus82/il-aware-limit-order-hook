@@ -11,6 +11,18 @@ Submitted to the **[UHI9 — Uniswap Hookathon](https://atrium.academy/uniswap)*
 
 ---
 
+## Development Timeline
+
+- **April 2026:** LimitOrderHook v2 deployed on Base + Unichain mainnet
+  (prior work, separate repo: [github.com/impetus82/limit-order-hook-v4](https://github.com/impetus82/limit-order-hook-v4))
+- **May 17–19, 2026:** ILAwareLimitOrderHook scaffolded as Hookathon
+  preparation (pre-competition architecture work — IL rebate engine,
+  SimulatedYieldVault, 46-test suite, Unichain mainnet deploy)
+- **May 25 – June 11, 2026:** Active Hookathon development period
+  (SimulatedYieldVault refinement, testing, demo, final submission)
+
+---
+
 ## What It Does
 
 Traditional limit orders on-chain are capital-idle: your tokens sit in a contract earning nothing while you wait for the price to hit your target.
@@ -208,7 +220,7 @@ forge script script/DeployHookathon.s.sol:DeployHookathon \
 ```
 
 The script automatically:
-1. Deploys `MockYieldVault` (ERC-4626 compatible)
+1. Deploys `SimulatedYieldVault` (ERC-4626 compatible, 3% APY via `block.timestamp`)
 2. Mines the CREATE2 salt via `HookMiner` to satisfy all 7 permission flags
 3. Deploys `ILAwareLimitOrderHook` at the mined address
 
@@ -216,18 +228,18 @@ The script automatically:
 
 | Network | Contract | Address |
 |---------|----------|---------|
-| Unichain Mainnet | ILAwareLimitOrderHook | [0x3BBB0d16E44A1a7be9e6268591656d82F7B554CE](https://uniscan.xyz/address/0x3BBB0d16E44A1a7be9e6268591656d82F7B554CE) |
-| Unichain Mainnet | MockYieldVault | [0x914f3cf377544da0a78AB7b51Cb7D8d4BAd7a892](https://uniscan.xyz/address/0x914f3cf377544da0a78AB7b51Cb7D8d4BAd7a892) |
-| Unichain Mainnet | USDC/WETH Pool | PoolId: `0xe7e90f68f0a7ac610e742357321169767b9dc97c3d7ae84deae63195ff8c7446` |
+| Unichain Mainnet | ILAwareLimitOrderHook | [0x8C19f1641946c662308000bB4E2Eaf684c81d4CE](https://uniscan.xyz/address/0x8C19f1641946c662308000bB4E2Eaf684c81d4CE) |
+| Unichain Mainnet | SimulatedYieldVault | [0xceee912C708516624E9aC5581c8FCC93eA8eE79d](https://uniscan.xyz/address/0xceee912C708516624E9aC5581c8FCC93eA8eE79d) |
+| Unichain Mainnet | USDC/WETH Pool | PoolId: `0xe1d695d4c147091549aeb6f9e78521a0184a1e7e272a71c12e708c881981f6ba` |
 
-Deploy tx: [0x543e6ade80cfa857df08527550d19748db30495751375f08e28f13db7f7e4ddf](https://uniscan.xyz/tx/0x543e6ade80cfa857df08527550d19748db30495751375f08e28f13db7f7e4ddf)
+Pool init tx: [0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a4](https://uniscan.xyz/tx/0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a4)
 
 ---
 
 ## Testing
 
 ```bash
-# Run all 50 tests
+# Run all 46 tests
 forge test -vvv
 
 # Unit tests (pure functions, no deployment)
@@ -240,7 +252,7 @@ forge test --match-contract ILAwareLimitOrderHookIntegrationTest -vvv
 forge test --gas-report
 ```
 
-**Test coverage:** 50 tests — 50 passing, 0 failing
+**Test coverage:** 46 tests — 46 passing, 0 failing
 
 Key scenarios covered:
 - `test_AfterInitialize` — baseline price recorded at pool creation
