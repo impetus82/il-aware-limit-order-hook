@@ -214,14 +214,13 @@ The script automatically:
 
 ### Deployed Addresses
 
-<!-- TODO: Update after running DeployHookathon.s.sol -->
-
 | Network | Contract | Address |
 |---------|----------|---------|
-| Unichain Mainnet | ILAwareLimitOrderHook | _pending deployment_ |
-| Unichain Mainnet | MockYieldVault | _pending deployment_ |
-| Unichain Testnet | ILAwareLimitOrderHook | _pending deployment_ |
-| Unichain Testnet | MockYieldVault | _pending deployment_ |
+| Unichain Mainnet | ILAwareLimitOrderHook | [0x3BBB0d16E44A1a7be9e6268591656d82F7B554CE](https://uniscan.xyz/address/0x3BBB0d16E44A1a7be9e6268591656d82F7B554CE) |
+| Unichain Mainnet | MockYieldVault | [0x914f3cf377544da0a78AB7b51Cb7D8d4BAd7a892](https://uniscan.xyz/address/0x914f3cf377544da0a78AB7b51Cb7D8d4BAd7a892) |
+| Unichain Mainnet | USDC/WETH Pool | PoolId: `0xe7e90f68f0a7ac610e742357321169767b9dc97c3d7ae84deae63195ff8c7446` |
+
+Deploy tx: [0x543e6ade80cfa857df08527550d19748db30495751375f08e28f13db7f7e4ddf](https://uniscan.xyz/tx/0x543e6ade80cfa857df08527550d19748db30495751375f08e28f13db7f7e4ddf)
 
 ---
 

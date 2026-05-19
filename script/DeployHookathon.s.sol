@@ -75,6 +75,12 @@ contract DeployHookathon is Script {
     /// @dev Unichain Mainnet PoolManager (same address on testnet)
     IPoolManager constant POOL_MANAGER = IPoolManager(0x1F98400000000000000000000000000000000004);
 
+    /// @dev Standard deterministic CREATE2 factory (EIP-2470 / Nick's factory).
+    ///      Foundry routes `new Contract{salt:}()` through this address during broadcast.
+    ///      Must be used as the `deployer` argument to HookMiner.find() so the
+    ///      mined address matches what will actually be deployed on-chain.
+    address constant HOOK_CREATE2_FACTORY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+
     // ── Hook Permission Flags (7 flags, total = 0x14CE) ──────
     //   AFTER_INITIALIZE_FLAG              = 1 << 12 = 0x1000
     //   AFTER_ADD_LIQUIDITY_FLAG           = 1 << 10 = 0x0400
@@ -109,13 +115,16 @@ contract DeployHookathon is Script {
 
         // ── Step 2: Mine CREATE2 salt for hook address ────────
         //    HookMiner runs in simulation (pure library) — no broadcast needed.
+        //    IMPORTANT: use HOOK_CREATE2_FACTORY (not the EOA) as the deployer, because
+        //    Foundry routes `new Contract{salt:}()` through the deterministic factory.
         bytes memory constructorArgs = abi.encode(POOL_MANAGER, deployer, address(vault));
 
         console2.log("\n[2] Mining CREATE2 salt for hook address...");
         console2.log("    Required flags (low 14 bits of address): 0x%x", FLAGS);
+        console2.log("    CREATE2 factory: ", HOOK_CREATE2_FACTORY);
 
         (address expectedHookAddress, bytes32 salt) =
-            HookMiner.find(deployer, FLAGS, type(ILAwareLimitOrderHook).creationCode, constructorArgs);
+            HookMiner.find(HOOK_CREATE2_FACTORY, FLAGS, type(ILAwareLimitOrderHook).creationCode, constructorArgs);
 
         console2.log("    Salt found:    ", vm.toString(salt));
         console2.log("    Expected hook: ", expectedHookAddress);
