@@ -239,7 +239,7 @@ Pool init tx: [0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a
 ## Testing
 
 ```bash
-# Run all 46 tests
+# Run all 51 tests
 forge test -vvv
 
 # Unit tests (pure functions, no deployment)
@@ -252,7 +252,7 @@ forge test --match-contract ILAwareLimitOrderHookIntegrationTest -vvv
 forge test --gas-report
 ```
 
-**Test coverage:** 46 tests — 46 passing, 0 failing
+**Test coverage:** 51 tests — 51 passing, 0 failing
 
 Key scenarios covered:
 - `test_AfterInitialize` — baseline price recorded at pool creation
