@@ -131,9 +131,9 @@ contract TriggerSwapUnichain is Script {
     // Unichain: USDC = currency0, WETH = currency1
     address constant USDC = 0x078D782b760474a361dDA0AF3839290b0EF57AD6;
     address constant WETH = 0x4200000000000000000000000000000000000006;
-    address constant HOOK = 0x9138F699F5F5AB19ed8271c3B143B229781A8040;
+    address constant HOOK = 0x3BBB0d16E44A1a7be9e6268591656d82F7B554CE;
 
-    uint24 constant POOL_FEE = 0; // Dynamic fee via hook
+    uint24 constant POOL_FEE = 3000; // 0.30% — matches pool initialized via DeployHookathon.s.sol
     int24 constant TICK_SPACING = 60;
 
     // 0.5 USDC — micro swap to push WETH price up
