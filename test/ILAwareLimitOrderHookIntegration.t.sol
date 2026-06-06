@@ -153,6 +153,8 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
 
     event FeeCollected(uint256 indexed orderId, Currency indexed currency, uint256 feeAmount);
 
+    event VaultRedeemFailed(uint256 indexed orderId, uint256 shares);
+
     event FeeBpsUpdated(uint256 oldFeeBps, uint256 newFeeBps);
 
     event FeesWithdrawn(Currency indexed currency, address indexed recipient, uint256 amount);
@@ -1178,6 +1180,99 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
 
         assertTrue(aliceAfter > aliceBefore, "Alice should receive tokens via claimOrder");
         console2.log("Alice received on claim:", aliceAfter - aliceBefore);
+    }
+
+    /// @notice June fix: a vault revert during claimOrder must not trap the user's funds.
+    /// @dev    Proves the solvency-safe graceful fallback: when a deposited order's vault redeem
+    ///         reverts, (1) claimOrder does NOT revert, (2) it emits VaultRedeemFailed, (3) it pays
+    ///         out nothing (so no other order's custodied balance is drawn down), (4) the position
+    ///         is preserved fully intact (NFT + vaultShares), and (5) once the vault recovers the
+    ///         same owner re-claims and receives their original output, burning the NFT.
+    function test_GracefulClaim_VaultReverts_JuneFix() public {
+        MockERC4626 vault = new MockERC4626(address(token0));
+
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory args = abi.encode(address(manager), address(this), address(vault));
+        vm.pauseGasMetering();
+        (address predicted, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
+        ILAwareLimitOrderHook hookWithVault =
+            new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
+        require(address(hookWithVault) == predicted, "mismatch");
+        vm.resumeGasMetering();
+
+        PoolKey memory vaultPoolKey = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 500,
+            tickSpacing: 10,
+            hooks: hookWithVault
+        });
+        manager.initialize(vaultPoolKey, TickMath.getSqrtPriceAtTick(0));
+
+        token0.mint(address(this), 5_000e18);
+        token1.mint(address(this), 5_000e18);
+        modifyLiquidityRouter.modifyLiquidity(
+            vaultPoolKey,
+            IPoolManager.ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)}),
+            ""
+        );
+
+        // Alice places a BUY order (zeroForOne = false → output is token0, the vault asset)
+        token1.mint(alice, 10e18);
+        vm.startPrank(alice);
+        token1.approve(address(hookWithVault), type(uint256).max);
+        token0.approve(address(hookWithVault), type(uint256).max);
+        uint256 orderId = hookWithVault.createLimitOrder(vaultPoolKey, false, 1e18, 1.002e18);
+        vm.stopPrank();
+
+        // Fill the order via a price-moving swap
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            vaultPoolKey,
+            IPoolManager.SwapParams({zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertTrue(hookWithVault.getOrder(orderId).isFilled, "order must be filled");
+
+        // Alice deposits the filled output into the vault
+        vm.prank(alice);
+        hookWithVault.depositToVault(orderId);
+        uint256 depositedShares = hookWithVault.getOrder(orderId).vaultShares;
+        assertGt(depositedShares, 0, "shares must be recorded after deposit");
+
+        // ── Vault goes down: redeem now reverts ──────────────────────────────
+        vault.setShouldRevert(true);
+        uint256 aliceBeforeFailedClaim = token0.balanceOf(alice);
+
+        // Claim must NOT revert; it gracefully emits VaultRedeemFailed and preserves state.
+        vm.expectEmit(true, false, false, true, address(hookWithVault));
+        emit VaultRedeemFailed(orderId, depositedShares);
+        vm.prank(alice);
+        hookWithVault.claimOrder(orderId, vaultPoolKey);
+
+        // Failure-path invariants: nothing paid out, nothing drawn down, position fully preserved.
+        assertEq(token0.balanceOf(alice), aliceBeforeFailedClaim, "no tokens paid out while vault is down");
+        assertEq(hookWithVault.ownerOf(orderId), alice, "NFT must be preserved (not burned) on vault failure");
+        assertEq(hookWithVault.getOrder(orderId).vaultShares, depositedShares, "vaultShares must be preserved");
+        assertTrue(hookWithVault.getOrder(orderId).isFilled, "order remains filled and claimable");
+
+        // ── Vault recovers: the same NFT owner re-claims and recovers their output ──
+        vault.setShouldRevert(false);
+        uint256 aliceBeforeRecovery = token0.balanceOf(alice);
+        vm.prank(alice);
+        hookWithVault.claimOrder(orderId, vaultPoolKey);
+        assertGt(token0.balanceOf(alice) - aliceBeforeRecovery, 0, "Alice recovers her output after the vault heals");
+
+        // NFT is now burned (claim settled): ownerOf must revert.
+        vm.expectRevert();
+        hookWithVault.ownerOf(orderId);
     }
 
     /*//////////////////////////////////////////////////////////////
