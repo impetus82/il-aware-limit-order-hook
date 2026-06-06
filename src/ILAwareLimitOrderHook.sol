@@ -262,6 +262,12 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice Emitted when a fee is collected from an order execution
     event FeeCollected(uint256 indexed orderId, Currency indexed currency, uint256 feeAmount);
 
+    /// @notice Emitted when an ERC-4626 vault redeem reverts during claimOrder.
+    /// @dev    The order is left FULLY intact (NFT, amounts, and vaultShares preserved) so the
+    ///         owner can re-claim once the vault recovers. No tokens are paid from the hook's
+    ///         balance on this path, which keeps every other order's custodied output solvent.
+    event VaultRedeemFailed(uint256 indexed orderId, uint256 shares);
+
     /*//////////////////////////////////////////////////////////////
                            CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
@@ -1033,7 +1039,12 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
 
     /// @notice Claim a filled limit order: transfer output + optional IL rebate from vault yield
     /// @dev Two-phase settlement: order fills into hook, user claims here with optional yield rebate.
-    ///      If vault redemption fails, output is transferred directly (graceful degradation).
+    ///      Vault-redeem failure is handled gracefully WITHOUT touching other orders' custodied
+    ///      funds: when a deposited order's vault redeem reverts, the principal is still locked in
+    ///      the vault (not in this hook), so we cannot safely pay it from the hook balance. Instead
+    ///      the position is left fully intact (NFT + amounts + vaultShares) and `VaultRedeemFailed`
+    ///      is emitted, so the owner can simply re-claim once the vault recovers. Orders whose
+    ///      output was never deposited (vaultShares == 0) are always paid directly from the hook.
     /// @param orderId   The filled order to claim
     /// @param poolKey   Pool key the order was placed in (needed for IL baseline lookup)
     function claimOrder(uint256 orderId, PoolKey calldata poolKey) external nonReentrant {
@@ -1058,24 +1069,32 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         uint256 rebate = 0;
 
         if (order.vaultShares > 0 && yieldVault != address(0)) {
-            try IERC4626(yieldVault).redeem(order.vaultShares, address(this), address(this)) returns (
-                uint256 redeemed
-            ) {
+            uint256 shares = order.vaultShares;
+            try IERC4626(yieldVault).redeem(shares, address(this), address(this)) returns (uint256 redeemed) {
+                // Vault paid `redeemed` assets into this hook; settling from that is solvency-safe.
+                order.vaultShares = 0;
                 if (redeemed > outputAmount) {
                     uint256 yieldEarned = redeemed - outputAmount;
                     rebate = yieldEarned < ilAmount ? yieldEarned : ilAmount;
                     totalOut = outputAmount + rebate;
                 } else {
+                    // Vault returned <= principal (lossy redeem): pay back exactly what we received.
                     totalOut = redeemed;
                 }
             } catch {
-                // Vault failed: fall back to hook balance (tokens were deposited, now stuck in vault)
-                // Graceful: transfer outputAmount from hook balance if available
+                // Vault redeem reverted: the principal is still locked in the vault, NOT in this
+                // hook. Paying `outputAmount` now would have to come from other orders' custodied
+                // balances and would break the hook's solvency. Instead we leave the position FULLY
+                // intact (NFT, amounts, and vaultShares all untouched) so the owner can re-claim
+                // once the vault recovers, and surface the failure via an event. No state mutates
+                // on this path, so nothing is lost and no one else's funds are drawn down.
+                emit VaultRedeemFailed(orderId, shares);
+                return;
             }
-            order.vaultShares = 0;
         }
 
-        // Mark claimed and burn the ERC721 position token
+        // Reaching here the payout is physically held by this hook (output was either never
+        // deposited, or was just redeemed from the vault). Settle, then burn the position token.
         order.amount0 = 0;
         order.amount1 = 0;
         _burn(orderId);
