@@ -112,10 +112,10 @@ IL is estimated purely from `sqrtPriceX96` delta — no Chainlink, no TWAP oracl
 ```
 sqrtR  = sqrtPriceCurrent * 1e9 / sqrtPriceEntry
 diff   = |sqrtR - 1e9|
-IL  ~  liquidity * diff^2 / (2 * 1e9^2)
+IL  ~  size * diff^2 / (2 * 1e9^2)        // size = the order's own output amount
 ```
 
-This is the second-order Taylor approximation of the exact IL formula, accurate to ~0.5% for price moves up to +/-50%. It uses only data already available inside the hook from V4's `StateLibrary`.
+This is a second-order Taylor approximation of the constant-product IL formula — no external feed, only the `sqrtPriceX96` snapshots the hook already records (`sqrtPriceBaseline` at pool init, `sqrtPriceAtFill` on execution). The multiplier is the order's own output `size`, so `ilAmount` is a conservative rebate-sizing figure rather than a pool-wide LP-IL number — which is all it needs to be, since the rebate is hard-capped at the yield actually earned.
 
 ### 5. ERC-721 Composability
 
@@ -143,9 +143,9 @@ This hook addresses that loss with a two-sided mitigation:
 The rebate formula `rebate = min(yield, ilAmount)` ensures:
 - The creator can never receive **more** than their actual IL (no windfall)
 - If `yield >= IL`: creator is fully compensated, keeps any excess yield
-- If `yield < IL`: creator keeps all yield, absorbs residual IL — but is **always better off** than without the hook
+- If `yield < IL`: creator keeps all yield and absorbs only the residual IL — net-positive versus an idle order whenever yield exceeds the small execution fee
 
-**The hook never takes a loss.** Vault yield is earned on tokens already owed to the user; the protocol is solvent by construction.
+**Solvency is preserved by construction.** The rebate is capped at `min(yield, ilAmount)`, so the hook never pays out more than the yield it actually earned on tokens already owed to that user, and every order is isolated by `orderId` (no shared pot to drain). If the vault ever reverts on redeem, `claimOrder` degrades gracefully: it draws nothing from other orders' custody, leaves the position fully intact (NFT + vault shares), and lets the owner re-claim once the vault recovers — so a vault failure can neither make the hook insolvent nor trap a user's funds.
 
 ---
 
@@ -239,7 +239,7 @@ Pool init tx: [0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a
 ## Testing
 
 ```bash
-# Run all 51 tests
+# Run all 52 tests
 forge test -vvv
 
 # Unit tests (pure functions, no deployment)
@@ -252,7 +252,7 @@ forge test --match-contract ILAwareLimitOrderHookIntegrationTest -vvv
 forge test --gas-report
 ```
 
-**Test coverage:** 51 tests — 51 passing, 0 failing
+**Test coverage:** 52 tests — 52 passing, 0 failing
 
 Key scenarios covered:
 - `test_AfterInitialize` — baseline price recorded at pool creation
@@ -260,6 +260,7 @@ Key scenarios covered:
 - `test_YieldRebate_OnClaim` — end-to-end vault yield rebate flow
 - `test_ERC721_Claim_After_Transfer` — secondary market: new NFT owner claims filled order
 - `testGracefulExecutionOnSlippage` — anti-DoS: failed orders do not block the pool
+- `test_GracefulClaim_VaultReverts_JuneFix` — vault redeem failure never traps funds; position preserved and re-claimable
 - `testBatchExecution` — multiple orders executed in a single swap
 
 ---
