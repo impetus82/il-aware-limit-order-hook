@@ -25,7 +25,7 @@ Submitted to the **[UHI9 — Uniswap Hookathon](https://atrium.academy/uniswap)*
 
 ## Partner Integrations
 
-No partner integrations. This project targets the Uniswap **Impermanent Loss & Yield Systems** theme directly, built on Uniswap V4 + OpenZeppelin primitives only (no third-party sponsor technology). Universal Router integration is planned as post-hookathon work.
+No partner integrations. This project targets the Uniswap **Impermanent Loss & Yield Systems** theme directly, built on Uniswap V4 + OpenZeppelin primitives only (no third-party sponsor technology).
 
 ---
 
