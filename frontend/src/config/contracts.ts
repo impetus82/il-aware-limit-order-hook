@@ -166,3 +166,16 @@ export const ERC20_ABI = [
 
 // ── Supported chain IDs ─────────────────────────────────
 export const SUPPORTED_CHAIN_IDS = Object.keys(CHAIN_CONTRACTS).map(Number);
+
+// ── Is the connected chain one we have contracts for? ───
+// getChainContracts() falls back to Unichain for unknown chains, so callers
+// must use this to detect a wrong-network wallet (writes would otherwise be
+// dispatched to the wallet's actual chain against Unichain addresses).
+export function isSupportedChain(chainId: number | undefined): boolean {
+  return chainId !== undefined && chainId in CHAIN_CONTRACTS;
+}
+
+// ── Demo vault disclosure ───────────────────────────────
+// The ERC-4626 vault on-chain is a SimulatedYieldVault (3% APY from block.timestamp),
+// not a real lending venue. UI copy must say "simulated" so nothing implies real yield.
+export const VAULT_APY_LABEL = "simulated 3% APY";

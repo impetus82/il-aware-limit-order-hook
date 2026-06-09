@@ -29,12 +29,13 @@ export const unichain = defineChain({
 const WALLETCONNECT_PROJECT_ID = "9510c31cbc488ccbbe6d7744ad750af1";
 
 const config = getDefaultConfig({
-  appName: "Limit Order Hook",
+  appName: "IL-Aware Limit Order Hook",
   projectId: WALLETCONNECT_PROJECT_ID,
-  chains: [base, unichain],
+  // Unichain first → it's the primary Hookathon target and RainbowKit's default.
+  chains: [unichain, base],
   transports: {
-    [base.id]: http("https://mainnet.base.org"),
     [unichain.id]: http("https://mainnet.unichain.org"),
+    [base.id]: http("https://mainnet.base.org"),
   },
   ssr: true,
 });
