@@ -86,12 +86,14 @@ contract SimulatedYieldVault {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// @dev Simple ERC4626 mock: stores deposits and returns shares 1:1 (no yield by default)
-///      Set `yieldBps` to simulate yield: redeem returns assets * (10000 + yieldBps) / 10000
+///      Set `yieldBps` to simulate yield (redeem returns more than principal) or
+///      `lossBps` to simulate a lossy vault (redeem returns less than principal).
 contract MockERC4626 {
     IERC20 public immutable asset;
     mapping(address => uint256) public sharesOf;
     uint256 public totalShares;
     uint256 public yieldBps; // extra yield in BPS (0 = no yield)
+    uint256 public lossBps; // shortfall in BPS (0 = no loss); redeem returns shares - loss
     bool public shouldRevert;
 
     constructor(address _asset) {
@@ -100,6 +102,10 @@ contract MockERC4626 {
 
     function setYieldBps(uint256 _yieldBps) external {
         yieldBps = _yieldBps;
+    }
+
+    function setLossBps(uint256 _lossBps) external {
+        lossBps = _lossBps;
     }
 
     function setShouldRevert(bool _shouldRevert) external {
@@ -119,10 +125,13 @@ contract MockERC4626 {
         require(sharesOf[owner] >= shares, "insufficient shares");
         sharesOf[owner] -= shares;
         totalShares -= shares;
-        // Return assets + yield
-        assets = shares + (shares * yieldBps / 10000);
-        // Mint extra tokens to simulate yield (test only)
-        MockERC20(address(asset)).mint(address(this), (shares * yieldBps / 10000));
+        // Net assets = principal + yield - loss (yield and loss are mutually exclusive in tests)
+        uint256 yieldAmt = shares * yieldBps / 10000;
+        uint256 lossAmt = shares * lossBps / 10000;
+        assets = shares + yieldAmt - lossAmt;
+        // Mint extra tokens to back simulated yield (test only); a loss shortfall simply stays
+        // behind in the vault, since the mock already custodies the full `shares` from deposit.
+        if (yieldAmt > 0) MockERC20(address(asset)).mint(address(this), yieldAmt);
         asset.transfer(receiver, assets);
     }
 }
@@ -1271,6 +1280,93 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         assertGt(token0.balanceOf(alice) - aliceBeforeRecovery, 0, "Alice recovers her output after the vault heals");
 
         // NFT is now burned (claim settled): ownerOf must revert.
+        vm.expectRevert();
+        hookWithVault.ownerOf(orderId);
+    }
+
+    /// @notice claimOrder with a lossy vault pays back exactly what the vault returned — no rebate,
+    ///         no over-payment of the recorded principal — and still settles + burns the position.
+    /// @dev    Covers the `redeemed <= outputAmount` branch of claimOrder. The vault returns 5% less
+    ///         than principal, so the user receives < outputAmount and no IL rebate, but the hook
+    ///         never pays more than the vault actually delivered (no draw on other orders' custody).
+    function test_ClaimOrder_LossyVaultRedeem_PaysRedeemedNotPrincipal() public {
+        MockERC4626 vault = new MockERC4626(address(token0));
+        vault.setLossBps(500); // vault returns 5% less than principal on redeem
+
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory args = abi.encode(address(manager), address(this), address(vault));
+        vm.pauseGasMetering();
+        (address predicted, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
+        ILAwareLimitOrderHook hookWithVault =
+            new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
+        require(address(hookWithVault) == predicted, "mismatch");
+        vm.resumeGasMetering();
+
+        PoolKey memory vaultPoolKey = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 500,
+            tickSpacing: 10,
+            hooks: hookWithVault
+        });
+        manager.initialize(vaultPoolKey, TickMath.getSqrtPriceAtTick(0));
+
+        token0.mint(address(this), 5_000e18);
+        token1.mint(address(this), 5_000e18);
+        modifyLiquidityRouter.modifyLiquidity(
+            vaultPoolKey,
+            IPoolManager.ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)}),
+            ""
+        );
+
+        // Alice places a BUY order (zeroForOne = false → output is token0, the vault asset)
+        token1.mint(alice, 10e18);
+        vm.startPrank(alice);
+        token1.approve(address(hookWithVault), type(uint256).max);
+        token0.approve(address(hookWithVault), type(uint256).max);
+        uint256 orderId = hookWithVault.createLimitOrder(vaultPoolKey, false, 1e18, 1.002e18);
+        vm.stopPrank();
+
+        // Fill the order
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            vaultPoolKey,
+            IPoolManager.SwapParams({zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertTrue(hookWithVault.getOrder(orderId).isFilled, "order must be filled");
+
+        // Deposit the output into the (lossy) vault
+        vm.prank(alice);
+        hookWithVault.depositToVault(orderId);
+
+        uint256 principal = hookWithVault.getOrder(orderId).amount0; // output held = vault shares (1:1)
+        uint256 shares = hookWithVault.getOrder(orderId).vaultShares;
+        assertEq(shares, principal, "1:1 deposit: shares == output principal");
+        uint256 expectedRedeemed = shares - (shares * 500 / 10000); // 5% loss
+        assertLt(expectedRedeemed, principal, "lossy vault returns less than principal");
+
+        // Claim
+        uint256 aliceBefore = token0.balanceOf(alice);
+        vm.prank(alice);
+        hookWithVault.claimOrder(orderId, vaultPoolKey);
+        uint256 received = token0.balanceOf(alice) - aliceBefore;
+
+        // Pays exactly the redeemed amount — no rebate, and never more than the vault delivered.
+        assertEq(received, expectedRedeemed, "pays exactly what the lossy vault returned");
+        assertLt(received, principal, "received < recorded principal (no rebate on a loss)");
+        assertGt(received, 0, "user still receives the recoverable amount");
+
+        // Position fully settled + burned.
+        assertEq(hookWithVault.getOrder(orderId).amount0, 0, "order amount zeroed after claim");
+        assertEq(hookWithVault.getOrder(orderId).vaultShares, 0, "vault shares cleared after claim");
         vm.expectRevert();
         hookWithVault.ownerOf(orderId);
     }
