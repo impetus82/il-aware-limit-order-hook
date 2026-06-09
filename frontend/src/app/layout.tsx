@@ -6,8 +6,9 @@ import { Providers } from "@/components/providers";
 const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "Limit Order Hook | Uniswap V4",
-  description: "Place limit orders on Uniswap V4 pools",
+  title: "IL-Aware Limit Order Hook | Uniswap V4",
+  description:
+    "Yield-bearing, IL-aware limit orders on Uniswap V4. Every order is an ERC-721 NFT; filled output earns simulated vault yield and pays an impermanent-loss rebate on claim.",
 };
 
 export default function RootLayout({

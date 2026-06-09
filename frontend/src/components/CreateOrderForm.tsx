@@ -1,5 +1,11 @@
 "use client";
 
+/* The React Compiler rules below are over-strict for this component's legitimate
+   async approve→create→receipt flow (UI state bridged from
+   useWaitForTransactionReceipt, and a handler auto-chained from that effect).
+   `next build` is clean; disabling them file-wide avoids whack-a-mole directives. */
+/* eslint-disable react-hooks/set-state-in-effect, react-hooks/immutability */
+
 import { useState, useMemo, useEffect } from "react";
 import {
   useAccount,
@@ -14,17 +20,20 @@ import {
   getSortedTokens,
   HOOK_ABI,
   ERC20_ABI,
+  STATE_VIEW_ABI,
   POOL_FEE,
   TICK_SPACING,
 } from "@/config/contracts";
-import { getTriggerPriceConfig } from "@/utils/price";
+import { getTriggerPriceConfig, sqrtPriceX96ToPrice, formatPrice } from "@/utils/price";
+import { extractTxError } from "@/utils/txError";
 
 // ── Types ───────────────────────────────────────────────
 type OrderDirection = "sell" | "buy";
 type TxStep = "idle" | "approving" | "waitApprove" | "placing" | "waitPlace" | "done";
 
-// uint96 max = 2^96 - 1
+// uint96 / uint128 maxima
 const UINT96_MAX = (1n << 96n) - 1n;
+const UINT128_MAX = (1n << 128n) - 1n;
 
 // ── Component ───────────────────────────────────────────
 export default function CreateOrderForm({
@@ -46,19 +55,33 @@ export default function CreateOrderForm({
   const [error, setError] = useState<string | null>(null);
 
   // ── Token mapping (UI-semantic, not sort-order) ───────
-  // "sell" = sell WETH for USDC → zeroForOne depends on sort order
-  // "buy"  = buy WETH with USDC → opposite direction
-  //
-  // On Base  (wethIsCurrency0=true):  sell WETH = zeroForOne=true
-  // On Unichain (wethIsCurrency0=false): sell WETH = zeroForOne=false (selling currency1)
+  // "sell" = sell WETH for USDC; "buy" = buy WETH with USDC.
+  // On Base (wethIsCurrency0=true): sell WETH = zeroForOne=true
+  // On Unichain (wethIsCurrency0=false): buy WETH = sell USDC (cur0) → zeroForOne=true
   const zeroForOne = chain.wethIsCurrency0
-    ? direction === "sell"  // Base: sell WETH (cur0) → true
-    : direction === "buy";  // Unichain: buy WETH means sell USDC (cur0) → true
+    ? direction === "sell"
+    : direction === "buy";
 
   const spendToken = direction === "sell" ? chain.weth : chain.usdc;
+  const receiveToken = direction === "sell" ? chain.usdc : chain.weth;
 
   // ── Hook contract reference ───────────────────────────
   const hookContract = { address: chain.hook, abi: HOOK_ABI } as const;
+
+  // ── Read: live market price (to anchor the trigger) ───
+  const { data: slot0 } = useReadContract({
+    address: chain.stateView,
+    abi: STATE_VIEW_ABI,
+    functionName: "getSlot0",
+    args: [chain.poolId],
+    query: { refetchInterval: 12_000 },
+  });
+  const marketPrice = useMemo(() => {
+    const sp = slot0?.[0] as bigint | undefined;
+    if (!sp) return null;
+    const p = sqrtPriceX96ToPrice(sp, chain.wethIsCurrency0);
+    return Number.isFinite(p) && p > 0 ? p : null;
+  }, [slot0, chain.wethIsCurrency0]);
 
   // ── Read: user balance ────────────────────────────────
   const { data: userBalance } = useReadContract({
@@ -82,27 +105,21 @@ export default function CreateOrderForm({
   const {
     data: approveTxHash,
     writeContract: writeApprove,
-    error: approveError,
     reset: resetApprove,
   } = useWriteContract();
 
   const { isSuccess: approveConfirmed, isLoading: approveLoading } =
-    useWaitForTransactionReceipt({
-      hash: approveTxHash,
-    });
+    useWaitForTransactionReceipt({ hash: approveTxHash });
 
   // ── Write: createLimitOrder ───────────────────────────
   const {
     data: createTxHash,
     writeContract: writeCreate,
-    error: createError,
     reset: resetCreate,
   } = useWriteContract();
 
   const { isSuccess: createConfirmed, isLoading: createLoading } =
-    useWaitForTransactionReceipt({
-      hash: createTxHash,
-    });
+    useWaitForTransactionReceipt({ hash: createTxHash });
 
   // ── Parsed amounts (DECIMAL-AWARE) ────────────────────
   const parsedAmount = useMemo(() => {
@@ -115,41 +132,47 @@ export default function CreateOrderForm({
   }, [amountIn, spendToken.decimals]);
 
   // ── Trigger price parsing ─────────────────────────────
-  // User ALWAYS enters "USDC per WETH" in the form.
-  // On Base:     stored as-is (currency1/currency0 = USDC/WETH)
-  // On Unichain: must INVERT because contract stores currency1/currency0 = WETH/USDC
+  // User ALWAYS enters "USDC per WETH". Base stores as-is; Unichain inverts.
   const triggerPriceConfig = getTriggerPriceConfig(chain.wethIsCurrency0);
 
   const parsedTriggerPrice = useMemo(() => {
     try {
       if (!triggerPrice || parseFloat(triggerPrice) <= 0) return null;
-
       if (triggerPriceConfig.needsInversion) {
-        // Unichain: user enters "3500" (USDC/WETH), contract needs WETH/USDC
-        // WETH/USDC = 1/3500 ≈ 0.000285714...
-        // Store as parseUnits("0.000285714...", 30)
         const userPrice = parseFloat(triggerPrice);
-        const invertedPrice = 1 / userPrice;
-        // Use high precision string for parseUnits
-        const invertedStr = invertedPrice.toFixed(24); // enough precision for 30 decimals
+        const invertedStr = (1 / userPrice).toFixed(24);
         return parseUnits(invertedStr, triggerPriceConfig.decimals);
-      } else {
-        // Base: straightforward
-        return parseUnits(triggerPrice, triggerPriceConfig.decimals);
       }
+      return parseUnits(triggerPrice, triggerPriceConfig.decimals);
     } catch {
       return null;
     }
   }, [triggerPrice, triggerPriceConfig]);
 
-  // Check if amount fits in uint96
+  // ── Validation flags ──────────────────────────────────
   const amountExceedsUint96 = parsedAmount !== null && parsedAmount > UINT96_MAX;
+  const triggerOutOfRange =
+    parsedTriggerPrice !== null &&
+    (parsedTriggerPrice === 0n || parsedTriggerPrice > UINT128_MAX);
+  const insufficientBalance =
+    parsedAmount !== null &&
+    userBalance !== undefined &&
+    parsedAmount > (userBalance as bigint);
 
-  // Do we already have sufficient allowance?
   const needsApproval =
     parsedAmount !== null &&
     currentAllowance !== undefined &&
     (currentAllowance as bigint) < parsedAmount;
+
+  // ── Estimated output preview ──────────────────────────
+  const outputEstimate = useMemo(() => {
+    const a = parseFloat(amountIn);
+    const t = parseFloat(triggerPrice);
+    if (!a || !t || a <= 0 || t <= 0) return null;
+    // sell WETH → receive USDC ≈ amount * price; buy WETH → receive ≈ amount / price
+    const value = direction === "sell" ? a * t : a / t;
+    return { value, symbol: receiveToken.symbol };
+  }, [amountIn, triggerPrice, direction, receiveToken.symbol]);
 
   // ── Effect: after approve confirmed → place order ─────
   useEffect(() => {
@@ -169,22 +192,8 @@ export default function CreateOrderForm({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [createConfirmed]);
 
-  // ── Effect: handle wallet rejections ──────────────────
-  useEffect(() => {
-    if (approveError) {
-      const msg = extractUserMessage(approveError);
-      setError(msg);
-      setTxStep("idle");
-    }
-  }, [approveError]);
-
-  useEffect(() => {
-    if (createError) {
-      const msg = extractUserMessage(createError);
-      setError(msg);
-      setTxStep("idle");
-    }
-  }, [createError]);
+  // Wallet rejections / write errors are handled in each writeContract's
+  // onError callback below (avoids setState-in-effect anti-pattern).
 
   // ── Handlers ──────────────────────────────────────────
   function handleSubmit() {
@@ -196,14 +205,20 @@ export default function CreateOrderForm({
       setError("Enter valid amount and trigger price");
       return;
     }
-
     if (amountExceedsUint96) {
       setError("Amount exceeds max uint96 (~79B tokens)");
       return;
     }
+    if (triggerOutOfRange) {
+      setError("Trigger price is out of range — try a realistic value");
+      return;
+    }
+    if (insufficientBalance) {
+      setError(`Insufficient ${spendToken.symbol} balance`);
+      return;
+    }
 
     if (needsApproval) {
-      // Step 1: Approve
       setTxStep("approving");
       writeApprove(
         {
@@ -214,11 +229,13 @@ export default function CreateOrderForm({
         },
         {
           onSuccess: () => setTxStep("waitApprove"),
-          onError: () => setTxStep("idle"),
+          onError: (err) => {
+            setError(extractTxError(err));
+            setTxStep("idle");
+          },
         }
       );
     } else {
-      // Already approved — skip to create
       handlePlaceOrder();
     }
   }
@@ -244,7 +261,10 @@ export default function CreateOrderForm({
       },
       {
         onSuccess: () => setTxStep("waitPlace"),
-        onError: () => setTxStep("idle"),
+        onError: (err) => {
+          setError(extractTxError(err));
+          setTxStep("idle");
+        },
       }
     );
   }
@@ -264,10 +284,12 @@ export default function CreateOrderForm({
     parsedAmount !== null &&
     parsedTriggerPrice !== null &&
     !amountExceedsUint96 &&
+    !triggerOutOfRange &&
+    !insufficientBalance &&
     txStep === "idle";
 
-  // ── Explorer label ────────────────────────────────────
   const explorerName = chain.chainLabel === "BASE" ? "BaseScan" : "Uniscan";
+  const inputsDisabled = txStep !== "idle";
 
   // ── Render ────────────────────────────────────────────
   return (
@@ -277,10 +299,18 @@ export default function CreateOrderForm({
       </h3>
 
       {/* Direction Toggle */}
-      <div className="flex gap-2 mb-4 sm:mb-5">
+      <div
+        role="radiogroup"
+        aria-label="Order direction"
+        className="flex gap-2 mb-4 sm:mb-5"
+      >
         <button
+          type="button"
+          role="radio"
+          aria-checked={direction === "sell"}
           onClick={() => setDirection("sell")}
-          className={`flex-1 py-2.5 sm:py-2 rounded-lg text-xs sm:text-sm font-medium transition-colors ${
+          disabled={inputsDisabled}
+          className={`flex-1 py-2.5 sm:py-2 rounded-lg text-xs sm:text-sm font-medium transition-colors disabled:opacity-50 ${
             direction === "sell"
               ? "bg-red-500/20 text-red-400 border border-red-500/40"
               : "bg-gray-800 text-gray-400 border border-gray-700 hover:border-gray-600"
@@ -289,8 +319,12 @@ export default function CreateOrderForm({
           Sell WETH → USDC
         </button>
         <button
+          type="button"
+          role="radio"
+          aria-checked={direction === "buy"}
           onClick={() => setDirection("buy")}
-          className={`flex-1 py-2.5 sm:py-2 rounded-lg text-xs sm:text-sm font-medium transition-colors ${
+          disabled={inputsDisabled}
+          className={`flex-1 py-2.5 sm:py-2 rounded-lg text-xs sm:text-sm font-medium transition-colors disabled:opacity-50 ${
             direction === "buy"
               ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/40"
               : "bg-gray-800 text-gray-400 border border-gray-700 hover:border-gray-600"
@@ -302,11 +336,12 @@ export default function CreateOrderForm({
 
       {/* Amount Input */}
       <div className="mb-4">
-        <label className="block text-xs text-gray-500 mb-1.5">
+        <label htmlFor="amount-input" className="block text-xs text-gray-500 mb-1.5">
           Amount ({spendToken.symbol})
         </label>
         <div className="relative">
           <input
+            id="amount-input"
             type="text"
             inputMode="decimal"
             placeholder="0.0"
@@ -318,18 +353,21 @@ export default function CreateOrderForm({
                 setError(null);
               }
             }}
-            disabled={txStep !== "idle"}
+            disabled={inputsDisabled}
             className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 sm:px-4 py-3 text-sm sm:text-base text-white
-                       placeholder-gray-600 focus:outline-none focus:border-gray-500
+                       placeholder-gray-500 focus:outline-none focus:border-gray-500
                        disabled:opacity-50 font-mono"
           />
           {address && userBalance !== undefined && (
             <button
+              type="button"
+              aria-label={`Use max ${spendToken.symbol} balance`}
               onClick={() =>
                 setAmountIn(formatUnits(userBalance as bigint, spendToken.decimals))
               }
-              className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-gray-500
-                         hover:text-gray-300 transition-colors"
+              disabled={inputsDisabled}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-gray-400
+                         hover:text-gray-200 transition-colors disabled:opacity-50"
             >
               MAX: {Number(formatUnits(userBalance as bigint, spendToken.decimals)).toFixed(
                 spendToken.decimals === 6 ? 2 : 4
@@ -338,18 +376,38 @@ export default function CreateOrderForm({
           )}
         </div>
         {amountExceedsUint96 && (
+          <p className="text-xs text-red-400 mt-1">Exceeds uint96 max (~79B tokens)</p>
+        )}
+        {!amountExceedsUint96 && insufficientBalance && (
           <p className="text-xs text-red-400 mt-1">
-            Exceeds uint96 max (~79B tokens)
+            Insufficient {spendToken.symbol} balance
           </p>
         )}
       </div>
 
       {/* Trigger Price Input */}
-      <div className="mb-5">
-        <label className="block text-xs text-gray-500 mb-1.5">
-          Trigger Price (USDC per WETH)
-        </label>
+      <div className="mb-4">
+        <div className="flex items-center justify-between mb-1.5">
+          <label htmlFor="trigger-input" className="block text-xs text-gray-500">
+            Trigger Price (USDC per WETH)
+          </label>
+          {marketPrice !== null && (
+            <button
+              type="button"
+              onClick={() => {
+                setTriggerPrice(formatPrice(marketPrice));
+                setError(null);
+              }}
+              disabled={inputsDisabled}
+              className="text-[11px] text-gray-500 hover:text-gray-300 transition-colors disabled:opacity-50"
+              title="Use the current market price"
+            >
+              Market ≈ {formatPrice(marketPrice)} · use
+            </button>
+          )}
+        </div>
         <input
+          id="trigger-input"
           type="text"
           inputMode="decimal"
           placeholder="3600"
@@ -361,12 +419,34 @@ export default function CreateOrderForm({
               setError(null);
             }
           }}
-          disabled={txStep !== "idle"}
+          disabled={inputsDisabled}
           className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 sm:px-4 py-3 text-sm sm:text-base text-white
-                     placeholder-gray-600 focus:outline-none focus:border-gray-500
+                     placeholder-gray-500 focus:outline-none focus:border-gray-500
                      disabled:opacity-50 font-mono"
         />
+        {triggerOutOfRange && (
+          <p className="text-xs text-red-400 mt-1">
+            Trigger price is out of range — try a realistic value
+          </p>
+        )}
       </div>
+
+      {/* Output estimate + custody note */}
+      {outputEstimate && !triggerOutOfRange && (
+        <div className="mb-5 rounded-lg bg-gray-800/50 border border-gray-700/60 px-3 py-2">
+          <p className="text-xs text-gray-400">
+            You&apos;ll receive ≈{" "}
+            <span className="text-emerald-400 font-mono">
+              {outputEstimate.value.toLocaleString(undefined, { maximumFractionDigits: 6 })}{" "}
+              {outputEstimate.symbol}
+            </span>{" "}
+            when filled.
+          </p>
+          <p className="text-[11px] text-gray-600 mt-0.5">
+            Output is held in the hook until you Claim (then earns optional vault yield + IL rebate).
+          </p>
+        </div>
+      )}
 
       {/* Error Message */}
       {error && (
@@ -380,7 +460,7 @@ export default function CreateOrderForm({
         <div className="space-y-3">
           <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-center">
             <p className="text-sm text-emerald-400 font-medium">
-              Order created successfully!
+              Order created — minted as ERC-721 NFT
             </p>
             {createTxHash && (
               <a
@@ -394,6 +474,7 @@ export default function CreateOrderForm({
             )}
           </div>
           <button
+            type="button"
             onClick={handleReset}
             className="w-full py-3 rounded-lg bg-gray-800 text-gray-300
                        hover:bg-gray-700 transition-colors text-sm font-medium"
@@ -403,6 +484,7 @@ export default function CreateOrderForm({
         </div>
       ) : (
         <button
+          type="button"
           onClick={handleSubmit}
           disabled={!canSubmit}
           className="w-full py-3 rounded-lg font-medium text-sm transition-all
@@ -466,7 +548,7 @@ function ButtonLabel({
 function SpinnerText({ text }: { text: string }) {
   return (
     <span className="inline-flex items-center gap-2">
-      <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+      <svg aria-hidden="true" className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
         <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" className="opacity-25" />
         <path
           d="M4 12a8 8 0 018-8"
@@ -479,24 +561,4 @@ function SpinnerText({ text }: { text: string }) {
       {text}
     </span>
   );
-}
-
-/** Extract a human-readable message from a wagmi/viem error */
-function extractUserMessage(err: Error): string {
-  const msg = err.message || "";
-
-  if (msg.includes("User rejected") || msg.includes("user rejected")) {
-    return "Transaction rejected in wallet";
-  }
-  if (msg.includes("insufficient funds")) {
-    return "Insufficient ETH for gas fees";
-  }
-  if (msg.includes("reverted")) {
-    const match = msg.match(/reason:\s*(.+?)(?:\n|$)/);
-    return match ? `Contract reverted: ${match[1]}` : "Transaction reverted by contract";
-  }
-  if (msg.length > 120) {
-    return msg.slice(0, 120) + "…";
-  }
-  return msg || "Unknown error";
 }

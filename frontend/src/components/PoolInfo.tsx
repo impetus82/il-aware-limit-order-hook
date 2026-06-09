@@ -99,7 +99,8 @@ export default function PoolInfo() {
         <h3 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
           Pool Price — WETH / USDC
         </h3>
-        <span className="text-[10px] text-gray-600 font-mono">
+        <span className="inline-flex items-center gap-1.5 text-[10px] text-gray-400 font-mono">
+          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" aria-hidden="true" />
           {chain.chainLabel} • LIVE
         </span>
       </div>
@@ -157,10 +158,10 @@ export default function PoolInfo() {
 
           {/* Raw sqrtPriceX96 */}
           <details className="group">
-            <summary className="text-[11px] text-gray-600 cursor-pointer hover:text-gray-400 transition-colors">
+            <summary className="text-[11px] text-gray-500 cursor-pointer hover:text-gray-300 transition-colors">
               Raw sqrtPriceX96 ▸
             </summary>
-            <p className="text-[11px] text-gray-600 font-mono mt-1 break-all">
+            <p className="text-[11px] text-gray-500 font-mono mt-1 break-all">
               {sqrtPriceX96?.toString()}
             </p>
           </details>
