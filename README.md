@@ -23,6 +23,12 @@ Submitted to the **[UHI9 — Uniswap Hookathon](https://atrium.academy/uniswap)*
 
 ---
 
+## Partner Integrations
+
+No partner integrations. This project targets the Uniswap **Impermanent Loss & Yield Systems** theme directly, built on Uniswap V4 + OpenZeppelin primitives only (no third-party sponsor technology). Universal Router integration is planned as post-hookathon work.
+
+---
+
 ## What It Does
 
 Traditional limit orders on-chain are capital-idle: your tokens sit in a contract earning nothing while you wait for the price to hit your target.
@@ -239,7 +245,7 @@ Pool init tx: [0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a
 ## Testing
 
 ```bash
-# Run all 52 tests
+# Run all 53 tests
 forge test -vvv
 
 # Unit tests (pure functions, no deployment)
@@ -252,7 +258,7 @@ forge test --match-contract ILAwareLimitOrderHookIntegrationTest -vvv
 forge test --gas-report
 ```
 
-**Test coverage:** 52 tests — 52 passing, 0 failing
+**Test coverage:** 53 tests — 53 passing, 0 failing
 
 Key scenarios covered:
 - `test_AfterInitialize` — baseline price recorded at pool creation
