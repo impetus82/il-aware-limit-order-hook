@@ -136,8 +136,9 @@ contract TriggerSwapUnichain is Script {
     uint24 constant POOL_FEE = 3000; // 0.30% — matches pool initialized via DeployHookathon.s.sol
     int24 constant TICK_SPACING = 60;
 
-    // 0.5 USDC — micro swap to push WETH price up
-    uint256 constant SWAP_AMOUNT_USDC = 5e5;
+    // 0.05 USDC — micro swap to push WETH price up.
+    // The demo pool is thin, so even this small swap moves the price enough to cross a trigger.
+    uint256 constant SWAP_AMOUNT_USDC = 5e4;
 
     function run() external {
         uint256 deployerPk = vm.envUint("DEPLOYER_PRIVATE_KEY");
@@ -168,7 +169,7 @@ contract TriggerSwapUnichain is Script {
         uint256 wethBal = IERC20(WETH).balanceOf(deployer);
         console2.log("USDC balance:", usdcBal);
         console2.log("WETH balance:", wethBal);
-        require(usdcBal >= SWAP_AMOUNT_USDC, "Need at least 0.5 USDC");
+        require(usdcBal >= SWAP_AMOUNT_USDC, "Need at least 0.05 USDC");
 
         vm.startBroadcast(deployerPk);
 
