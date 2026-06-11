@@ -6,8 +6,7 @@ Submitted to the **[UHI9 — Uniswap Hookathon](https://atrium.academy/uniswap)*
 
 ---
 
-<!-- TODO: Add YouTube Demo Video link once recorded -->
-> **Demo Video:** _coming soon_
+> **Demo Video (≤5 min):** [Watch on YouTube ↗](https://youtu.be/eikjiI5kq8I)
 >
 > **Live Frontend:** [il-aware-hook.vercel.app](https://il-aware-hook.vercel.app) (Unichain mainnet)
 
