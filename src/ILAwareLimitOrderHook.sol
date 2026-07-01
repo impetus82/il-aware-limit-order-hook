@@ -120,6 +120,9 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice Thrown when the poolKey passed to claimOrder does not match the order's pool (H1)
     error PoolKeyMismatch();
 
+    /// @notice Thrown if a vault-path claim payout would exceed what the vault just redeemed (M2 solvency)
+    error RebateExceedsRedeemed();
+
     /*//////////////////////////////////////////////////////////////
                             DATA STRUCTURES
     //////////////////////////////////////////////////////////////*/
@@ -500,6 +503,12 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @param currency The currency to withdraw fees for
     /// @param recipient The address to send fees to
     function withdrawFees(Currency currency, address recipient) external onlyOwner {
+        // M2 solvency invariant: pendingFees[currency] is credited ONLY after the matching
+        // feeAmount is physically taken into this hook (see _executeOrder), and it is the only
+        // balance this function ever touches. Order outputs are taken and tracked separately
+        // (order.amount0/amount1), and vault deposits leave the hook entirely — so withdrawing
+        // fees can never dip into funds backing user orders. Proven by
+        // test_M2_WithdrawFees_CannotEatOrderPrincipal.
         uint256 amount = pendingFees[currency];
         if (amount == 0) revert NoFeesToWithdraw();
 
@@ -1120,6 +1129,12 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                     // Vault returned <= principal (lossy redeem): pay back exactly what we received.
                     totalOut = redeemed;
                 }
+                // M2 structural solvency: in the vault path the payout is funded ONLY by what the
+                // vault just delivered this tx, so it must never exceed `redeemed`. This makes the
+                // "rebate is self-funded" property hold BY CONSTRUCTION (not by arithmetic
+                // coincidence of the rebate formula) — a future formula change cannot silently
+                // draw from other orders' custody or from pendingFees.
+                if (totalOut > redeemed) revert RebateExceedsRedeemed();
             } catch {
                 // Vault redeem reverted: the principal is still locked in the vault, NOT in this
                 // hook. Paying `outputAmount` now would have to come from other orders' custodied

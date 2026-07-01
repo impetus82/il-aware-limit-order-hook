@@ -705,6 +705,131 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         hook.ownerOf(orderId);
     }
 
+    /// @notice M2: withdrawing accumulated fees must never dip into the token balance backing
+    ///         user order outputs — after a full fee withdrawal every order still claims in full.
+    function test_M2_WithdrawFees_CannotEatOrderPrincipal() public {
+        // Two BUY-token0 orders (output token0 is custodied in the hook on fill; fees accrue
+        // in token0's pendingFees).
+        vm.startPrank(alice);
+        uint256 o1 = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
+        uint256 o2 = hook.createLimitOrder(poolKey, false, 2e18, 1.002e18);
+        vm.stopPrank();
+
+        // Fill both via a price-down swap
+        token0.mint(address(this), 200e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            poolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -200e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertTrue(hook.getOrder(o1).isFilled && hook.getOrder(o2).isFilled, "both orders should fill");
+
+        uint256 fees = hook.getPendingFees(poolKey.currency0);
+        assertTrue(fees > 0, "fees should accrue in token0");
+
+        uint256 out1 = hook.getOrder(o1).amount0; // buy-token0 output stored in amount0
+        uint256 out2 = hook.getOrder(o2).amount0;
+        assertTrue(out1 > 0 && out2 > 0, "outputs recorded");
+
+        // Solvency: the hook must hold every order's output PLUS the fees.
+        assertTrue(
+            token0.balanceOf(address(hook)) >= out1 + out2 + fees, "hook must cover all outputs + fees"
+        );
+
+        // Owner drains ALL fees.
+        uint256 ownerBefore = token0.balanceOf(address(this));
+        hook.withdrawFees(poolKey.currency0, address(this));
+        assertEq(token0.balanceOf(address(this)) - ownerBefore, fees, "owner withdraws exactly the fees");
+
+        // After the fee withdrawal both owners still claim their FULL output — principal untouched.
+        uint256 aliceBefore = token0.balanceOf(alice);
+        vm.startPrank(alice);
+        hook.claimOrder(o1, poolKey);
+        hook.claimOrder(o2, poolKey);
+        vm.stopPrank();
+        assertEq(
+            token0.balanceOf(alice) - aliceBefore, out1 + out2, "both outputs claimable in full after fees withdrawn"
+        );
+    }
+
+    /// @notice M2: fees + vault deposit + full fee withdrawal coexist solvently — a deposited
+    ///         order still claims in full after the owner drains all fees (vault + fees interaction).
+    function test_M2_Solvency_VaultPlusFees() public {
+        MockERC4626 vault = new MockERC4626(address(token0));
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory args = abi.encode(address(manager), address(this), address(vault));
+        vm.pauseGasMetering();
+        (address predicted, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
+        ILAwareLimitOrderHook hookWithVault =
+            new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
+        require(address(hookWithVault) == predicted, "mismatch");
+        vm.resumeGasMetering();
+
+        PoolKey memory vpk = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 500,
+            tickSpacing: 10,
+            hooks: hookWithVault
+        });
+        manager.initialize(vpk, TickMath.getSqrtPriceAtTick(0));
+        token0.mint(address(this), 5_000e18);
+        token1.mint(address(this), 5_000e18);
+        token0.approve(address(modifyLiquidityRouter), type(uint256).max);
+        token1.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            vpk,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)
+            }),
+            ""
+        );
+
+        token1.mint(alice, 10e18);
+        vm.startPrank(alice);
+        token1.approve(address(hookWithVault), type(uint256).max);
+        uint256 orderId = hookWithVault.createLimitOrder(vpk, false, 1e18, 1.002e18);
+        vm.stopPrank();
+
+        // Fill (fee accrues in token0), then deposit the output into the vault.
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            vpk,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertTrue(hookWithVault.getOrder(orderId).isFilled, "order should fill");
+        assertTrue(hookWithVault.getPendingFees(Currency.wrap(address(token0))) > 0, "fee accrued in token0");
+
+        vm.prank(alice);
+        hookWithVault.depositToVault(orderId);
+        assertTrue(hookWithVault.getOrder(orderId).vaultShares > 0, "output deposited to vault");
+
+        // Owner drains ALL token0 fees.
+        hookWithVault.withdrawFees(Currency.wrap(address(token0)), address(this));
+
+        // The deposited order still claims in full (funded by the vault redemption; guard holds).
+        uint256 aliceBefore = token0.balanceOf(alice);
+        vm.prank(alice);
+        hookWithVault.claimOrder(orderId, vpk);
+        assertTrue(
+            token0.balanceOf(alice) > aliceBefore, "deposited order still claims in full after fees withdrawn"
+        );
+    }
+
     /*//////////////////////////////////////////////////////////////
               PHASE 3.14: GRACEFUL EXECUTION & ADMIN TESTS
     //////////////////////////////////////////////////////////////*/
