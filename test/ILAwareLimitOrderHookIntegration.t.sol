@@ -830,6 +830,42 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         );
     }
 
+    /// @notice M3: O(1) bucket removal keeps the orderBucketIndex map consistent. Cancelling a
+    ///         non-last order (swap-and-pop moves the last element into its slot) must not corrupt
+    ///         the remaining orders' removability — including the very order that was moved.
+    function test_M3_BucketRemovalIsConsistent() public {
+        // Three BUY orders at the SAME trigger -> same (pool, tick) bucket.
+        vm.startPrank(alice);
+        uint256 o1 = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
+        uint256 o2 = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
+        uint256 o3 = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
+        vm.stopPrank();
+
+        int24 tick = hook.getTickBucket(o1);
+        PoolId pid = poolKey.toId();
+        assertEq(hook.getOrdersInTick(pid, tick).length, 3, "bucket has 3 orders");
+
+        // Cancel the FIRST order (index 0) -> swap-and-pop moves o3 into slot 0.
+        vm.prank(alice);
+        hook.cancelOrder(o1);
+        assertEq(hook.getOrdersInTick(pid, tick).length, 2, "bucket has 2 after first cancel");
+
+        // Cancel o3 — now living at index 0 after the move. This only works if orderBucketIndex[o3]
+        // was updated during the swap-and-pop; a stale index would remove the wrong order or revert.
+        vm.prank(alice);
+        hook.cancelOrder(o3);
+        uint256[] memory remaining = hook.getOrdersInTick(pid, tick);
+        assertEq(remaining.length, 1, "bucket has 1 after moved-order cancel");
+        assertEq(remaining[0], o2, "o2 is the surviving order (index map stayed consistent)");
+        assertTrue(hook.isActiveTick(pid, tick), "tick still active with o2 remaining");
+
+        // Cancel the last one -> bucket empties -> tick unlinked.
+        vm.prank(alice);
+        hook.cancelOrder(o2);
+        assertEq(hook.getOrdersInTick(pid, tick).length, 0, "bucket empty after last cancel");
+        assertFalse(hook.isActiveTick(pid, tick), "tick removed from the list when empty");
+    }
+
     /*//////////////////////////////////////////////////////////////
               PHASE 3.14: GRACEFUL EXECUTION & ADMIN TESTS
     //////////////////////////////////////////////////////////////*/

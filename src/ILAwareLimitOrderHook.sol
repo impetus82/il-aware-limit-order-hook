@@ -150,7 +150,9 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice All orders by ID
     mapping(uint256 => LimitOrder) public orders;
 
-    /// @notice Order IDs owned by each user
+    /// @notice Order IDs ever created by each user (append-only, read ONLY off-chain).
+    /// @dev Never iterated on-chain, so its unbounded growth is not a DoS vector (M3);
+    ///      off-chain callers should paginate getUserOrders() or use ERC-721 enumeration.
     mapping(address => uint256[]) private userOrders;
 
     /// @notice Auto-incrementing order counter
@@ -162,6 +164,11 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
 
     /// @notice Reverse mapping: orderId -> aligned tick bucket
     mapping(uint256 => int24) private orderTickBucket;
+
+    /// @notice Reverse mapping: orderId -> its index within tickToOrders[poolId][tick] (M3).
+    /// @dev Enables O(1) swap-and-pop removal from a bucket without a linear scan, so
+    ///      cancelOrder/forceCancelOrder cannot be griefed by flooding a tick with many orders.
+    mapping(uint256 => uint256) private orderBucketIndex;
 
     /*//////////////////////////////////////////////////////////////
                     SORTED LINKED LIST OF ACTIVE TICKS
@@ -381,10 +388,12 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         // poolKey whose pool was not initialized through this hook's _afterInitialize).
         _ensurePoolSentinels(poolId);
 
-        // Index by (pool, tick) bucket
+        // Index by (pool, tick) bucket, recording the order's index for O(1) removal (M3)
         int24 alignedTick =
             _alignTick(TickMath.getTickAtSqrtPrice(uint128ToSqrtPrice(triggerPrice)), poolKey.tickSpacing);
-        tickToOrders[poolId][alignedTick].push(orderId);
+        uint256[] storage bucket = tickToOrders[poolId][alignedTick];
+        orderBucketIndex[orderId] = bucket.length;
+        bucket.push(orderId);
         orderTickBucket[orderId] = alignedTick;
 
         // Insert tick into this pool's sorted linked list if not already active
@@ -406,16 +415,10 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         if (ownerOf(orderId) != msg.sender) revert NotOrderCreator();
         if (order.isFilled) revert OrderAlreadyFilled();
 
-        // Remove from (pool, tick) bucket
+        // Remove from (pool, tick) bucket — O(1) via the stored index (M3)
         PoolId poolId = order.poolId;
         int24 tick = orderTickBucket[orderId];
-        uint256[] storage orderIds = tickToOrders[poolId][tick];
-        for (uint256 i = 0; i < orderIds.length; i++) {
-            if (orderIds[i] == orderId) {
-                _removeFromArray(orderIds, i);
-                break;
-            }
-        }
+        _removeFromBucket(poolId, tick, orderBucketIndex[orderId]);
 
         // If tick bucket is now empty, remove from this pool's linked list
         if (tickToOrders[poolId][tick].length == 0) {
@@ -457,16 +460,10 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
 
         address recipient = ownerOf(orderId);
 
-        // Remove from (pool, tick) bucket
+        // Remove from (pool, tick) bucket — O(1) via the stored index (M3)
         PoolId poolId = order.poolId;
         int24 tick = orderTickBucket[orderId];
-        uint256[] storage orderIds = tickToOrders[poolId][tick];
-        for (uint256 i = 0; i < orderIds.length; i++) {
-            if (orderIds[i] == orderId) {
-                _removeFromArray(orderIds, i);
-                break;
-            }
-        }
+        _removeFromBucket(poolId, tick, orderBucketIndex[orderId]);
 
         if (tickToOrders[poolId][tick].length == 0) {
             _removeActiveTick(poolId, tick);
@@ -672,7 +669,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
 
             // Lazy cleanup: remove filled or burned (cancelled) orders
             if (order.isFilled || _ownerOf(orderId) == address(0)) {
-                _removeFromArray(orderIdsInTick, i);
+                _removeFromBucket(poolId, tick, i);
                 continue;
             }
 
@@ -693,7 +690,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                 // Phase 3.14: graceful execution - skip on failure instead of revert
                 bool success = _executeOrder(poolKey, order, orderId);
                 if (success) {
-                    _removeFromArray(orderIdsInTick, i);
+                    _removeFromBucket(poolId, tick, i);
                     // Don't increment i - swap-and-pop moved new element here
                 } else {
                     // Order failed (slippage etc.) - leave it for next swap
@@ -987,11 +984,23 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         return compressed * tickSpacing;
     }
 
-    /// @notice Remove element at index using swap-and-pop (O(1))
-    function _removeFromArray(uint256[] storage arr, uint256 index) internal {
+    /// @notice O(1) removal of the order at `index` from a (pool, tick) bucket via swap-and-pop,
+    ///         keeping `orderBucketIndex` consistent so cancel/forceCancel need no linear scan (M3).
+    /// @dev The last element is moved into the freed slot and its index updated; callers pass the
+    ///      index from `orderBucketIndex[orderId]` (cancel/forceCancel) or the loop index `i`
+    ///      (_processTickBucket, where arr[i] is the order being removed).
+    function _removeFromBucket(PoolId poolId, int24 tick, uint256 index) internal {
+        uint256[] storage arr = tickToOrders[poolId][tick];
         if (index >= arr.length) revert IndexOutOfBounds();
-        arr[index] = arr[arr.length - 1];
+        uint256 removedOrderId = arr[index];
+        uint256 lastIndex = arr.length - 1;
+        if (index != lastIndex) {
+            uint256 lastOrderId = arr[lastIndex];
+            arr[index] = lastOrderId;
+            orderBucketIndex[lastOrderId] = index;
+        }
         arr.pop();
+        delete orderBucketIndex[removedOrderId];
     }
 
     /*//////////////////////////////////////////////////////////////
