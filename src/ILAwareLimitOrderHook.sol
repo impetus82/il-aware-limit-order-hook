@@ -117,6 +117,9 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice Thrown when trying to claim an order that was already claimed
     error OrderAlreadyClaimed();
 
+    /// @notice Thrown when the poolKey passed to claimOrder does not match the order's pool (H1)
+    error PoolKeyMismatch();
+
     /*//////////////////////////////////////////////////////////////
                             DATA STRUCTURES
     //////////////////////////////////////////////////////////////*/
@@ -134,6 +137,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         bool zeroForOne;
         uint256 vaultShares; // ERC4626 vault shares for yield (0 = not deposited)
         uint160 sqrtPriceAtFill; // sqrtPriceX96 at execution time (for IL calc)
+        PoolId poolId; // H1/H2: the pool this order belongs to (isolation + claim validation)
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -149,9 +153,9 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice Auto-incrementing order counter
     uint256 public nextOrderId;
 
-    /// @notice Tick-based order indexing for O(1) lookup
-    /// @dev Key is the aligned tick (rounded to tickSpacing grid)
-    mapping(int24 => uint256[]) public tickToOrders;
+    /// @notice Tick-based order indexing for O(1) lookup, namespaced per pool (H2)
+    /// @dev Key is (PoolId, aligned tick). Orders never collide across pools.
+    mapping(PoolId => mapping(int24 => uint256[])) public tickToOrders;
 
     /// @notice Reverse mapping: orderId -> aligned tick bucket
     mapping(uint256 => int24) private orderTickBucket;
@@ -167,16 +171,21 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     int24 public constant SENTINEL_MIN = type(int24).min; // -8388608
     int24 public constant SENTINEL_MAX = type(int24).max; //  8388607
 
-    /// @notice Forward pointer: tick -> next higher active tick
-    mapping(int24 => int24) public nextActiveTick;
+    /// @notice Forward pointer: (pool, tick) -> next higher active tick (H2: per-pool list)
+    mapping(PoolId => mapping(int24 => int24)) public nextActiveTick;
 
-    /// @notice Backward pointer: tick -> next lower active tick
-    mapping(int24 => int24) public prevActiveTick;
+    /// @notice Backward pointer: (pool, tick) -> next lower active tick (H2: per-pool list)
+    mapping(PoolId => mapping(int24 => int24)) public prevActiveTick;
 
-    /// @notice Quick check: does this tick have orders?
-    /// @dev True when tickToOrders[tick].length > 0 AND tick is linked.
+    /// @notice Quick check: does this (pool, tick) have orders? (H2: per-pool)
+    /// @dev True when tickToOrders[poolId][tick].length > 0 AND tick is linked.
     ///      Prevents double-insertion and enables O(1) removal check.
-    mapping(int24 => bool) public isActiveTick;
+    mapping(PoolId => mapping(int24 => bool)) public isActiveTick;
+
+    /// @notice Whether a pool's active-tick linked-list sentinels have been initialized (H2).
+    /// @dev Guards against the default-zero trap: an uninitialized list would have
+    ///      nextActiveTick[poolId][SENTINEL_MIN] == 0 (a valid tick), breaking the walk.
+    mapping(PoolId => bool) private poolListInitialized;
 
     /// @dev Reentrancy guard for execution
     bool private isExecuting;
@@ -281,9 +290,8 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         ERC721("Limit Order Position", "LOP")
     {
         yieldVault = _yieldVault;
-        // Initialize sentinel linked list: SENTINEL_MIN <-> SENTINEL_MAX
-        nextActiveTick[SENTINEL_MIN] = SENTINEL_MAX;
-        prevActiveTick[SENTINEL_MAX] = SENTINEL_MIN;
+        // Active-tick linked-list sentinels are initialized PER-POOL (H2) in
+        // _afterInitialize / _ensurePoolSentinels — each pool has its own list.
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -336,6 +344,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
 
         orderId = nextOrderId++;
 
+        PoolId poolId = poolKey.toId();
         address token0Addr = Currency.unwrap(poolKey.currency0);
         address token1Addr = Currency.unwrap(poolKey.currency1);
 
@@ -356,7 +365,8 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             isFilled: false,
             zeroForOne: zeroForOne,
             vaultShares: 0,
-            sqrtPriceAtFill: 0
+            sqrtPriceAtFill: 0,
+            poolId: poolId
         });
 
         // Mint ERC721 NFT representing this position (orderId = tokenId)
@@ -364,15 +374,19 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
 
         userOrders[msg.sender].push(orderId);
 
-        // Index by tick bucket
+        // Ensure this pool's linked-list sentinels exist (H2: also covers a caller-supplied
+        // poolKey whose pool was not initialized through this hook's _afterInitialize).
+        _ensurePoolSentinels(poolId);
+
+        // Index by (pool, tick) bucket
         int24 alignedTick =
             _alignTick(TickMath.getTickAtSqrtPrice(uint128ToSqrtPrice(triggerPrice)), poolKey.tickSpacing);
-        tickToOrders[alignedTick].push(orderId);
+        tickToOrders[poolId][alignedTick].push(orderId);
         orderTickBucket[orderId] = alignedTick;
 
-        // Insert tick into sorted linked list if not already active
-        if (!isActiveTick[alignedTick]) {
-            _insertActiveTick(alignedTick);
+        // Insert tick into this pool's sorted linked list if not already active
+        if (!isActiveTick[poolId][alignedTick]) {
+            _insertActiveTick(poolId, alignedTick);
         }
 
         emit OrderCreated(orderId, msg.sender, zeroForOne, amountIn, triggerPrice);
@@ -389,9 +403,10 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         if (ownerOf(orderId) != msg.sender) revert NotOrderCreator();
         if (order.isFilled) revert OrderAlreadyFilled();
 
-        // Remove from tick bucket
+        // Remove from (pool, tick) bucket
+        PoolId poolId = order.poolId;
         int24 tick = orderTickBucket[orderId];
-        uint256[] storage orderIds = tickToOrders[tick];
+        uint256[] storage orderIds = tickToOrders[poolId][tick];
         for (uint256 i = 0; i < orderIds.length; i++) {
             if (orderIds[i] == orderId) {
                 _removeFromArray(orderIds, i);
@@ -399,9 +414,9 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             }
         }
 
-        // If tick bucket is now empty, remove from linked list
-        if (tickToOrders[tick].length == 0) {
-            _removeActiveTick(tick);
+        // If tick bucket is now empty, remove from this pool's linked list
+        if (tickToOrders[poolId][tick].length == 0) {
+            _removeActiveTick(poolId, tick);
         }
 
         // Return tokens
@@ -431,9 +446,10 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
 
         address recipient = ownerOf(orderId);
 
-        // Remove from tick bucket
+        // Remove from (pool, tick) bucket
+        PoolId poolId = order.poolId;
         int24 tick = orderTickBucket[orderId];
-        uint256[] storage orderIds = tickToOrders[tick];
+        uint256[] storage orderIds = tickToOrders[poolId][tick];
         for (uint256 i = 0; i < orderIds.length; i++) {
             if (orderIds[i] == orderId) {
                 _removeFromArray(orderIds, i);
@@ -441,8 +457,8 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             }
         }
 
-        if (tickToOrders[tick].length == 0) {
-            _removeActiveTick(tick);
+        if (tickToOrders[poolId][tick].length == 0) {
+            _removeActiveTick(poolId, tick);
         }
 
         // Return tokens to current NFT owner
@@ -500,9 +516,9 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         return userOrders[user];
     }
 
-    /// @notice Get all order IDs in a specific tick bucket
-    function getOrdersInTick(int24 tick) external view returns (uint256[] memory) {
-        return tickToOrders[tick];
+    /// @notice Get all order IDs in a specific (pool, tick) bucket
+    function getOrdersInTick(PoolId poolId, int24 tick) external view returns (uint256[] memory) {
+        return tickToOrders[poolId][tick];
     }
 
     /// @notice Get the tick bucket an order was assigned to
@@ -510,14 +526,14 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         return orderTickBucket[orderId];
     }
 
-    /// @notice Get the next active tick above the given tick
-    function getNextActiveTick(int24 tick) external view returns (int24) {
-        return nextActiveTick[tick];
+    /// @notice Get the next active tick above the given tick (per pool)
+    function getNextActiveTick(PoolId poolId, int24 tick) external view returns (int24) {
+        return nextActiveTick[poolId][tick];
     }
 
-    /// @notice Get the next active tick below the given tick
-    function getPrevActiveTick(int24 tick) external view returns (int24) {
-        return prevActiveTick[tick];
+    /// @notice Get the next active tick below the given tick (per pool)
+    function getPrevActiveTick(PoolId poolId, int24 tick) external view returns (int24) {
+        return prevActiveTick[poolId][tick];
     }
 
     /// @notice Get accumulated fees for a specific currency
@@ -570,26 +586,26 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     ///      - !zeroForOne swap (price UP) -> scan downward for SELL orders (trigger when price >= X)
     ///      - zeroForOne swap (price DOWN) -> scan upward for BUY orders (trigger when price <= X)
     function _tryExecuteOrders(PoolKey calldata poolKey, uint128 currentPrice, bool swapZeroForOne) internal {
-        address token0 = Currency.unwrap(poolKey.currency0);
+        PoolId poolId = poolKey.toId();
 
         int24 activeTickCount = 0;
 
         if (swapZeroForOne) {
             // Price went DOWN -> scan upward for BUY orders (triggerPrice >= currentPrice)
             // Start from the lowest active tick and go up
-            int24 tick = nextActiveTick[SENTINEL_MIN];
+            int24 tick = nextActiveTick[poolId][SENTINEL_MIN];
 
             while (tick != SENTINEL_MAX && activeTickCount < MAX_ACTIVE_TICK_SCAN) {
                 if (gasleft() < GAS_LIMIT_PER_ORDER) break;
 
                 // Cache next before potential removal
-                int24 nextTick = nextActiveTick[tick];
+                int24 nextTick = nextActiveTick[poolId][tick];
 
-                _processTickBucket(tick, token0, currentPrice, poolKey);
+                _processTickBucket(poolId, tick, currentPrice, poolKey);
 
                 // If bucket is now empty after processing, remove from list
-                if (tickToOrders[tick].length == 0) {
-                    _removeActiveTick(tick);
+                if (tickToOrders[poolId][tick].length == 0) {
+                    _removeActiveTick(poolId, tick);
                 }
 
                 activeTickCount++;
@@ -598,19 +614,19 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         } else {
             // Price went UP -> scan downward for SELL orders (triggerPrice <= currentPrice)
             // Start from the highest active tick and go down
-            int24 tick = prevActiveTick[SENTINEL_MAX];
+            int24 tick = prevActiveTick[poolId][SENTINEL_MAX];
 
             while (tick != SENTINEL_MIN && activeTickCount < MAX_ACTIVE_TICK_SCAN) {
                 if (gasleft() < GAS_LIMIT_PER_ORDER) break;
 
                 // Cache prev before potential removal
-                int24 prevTick = prevActiveTick[tick];
+                int24 prevTick = prevActiveTick[poolId][tick];
 
-                _processTickBucket(tick, token0, currentPrice, poolKey);
+                _processTickBucket(poolId, tick, currentPrice, poolKey);
 
                 // If bucket is now empty after processing, remove from list
-                if (tickToOrders[tick].length == 0) {
-                    _removeActiveTick(tick);
+                if (tickToOrders[poolId][tick].length == 0) {
+                    _removeActiveTick(poolId, tick);
                 }
 
                 activeTickCount++;
@@ -624,8 +640,8 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     ///      lazy cleanup of filled/cancelled orders.
     ///      Phase 3.14: Failed executions emit OrderExecutionFailed and skip
     ///      (order stays in bucket for retry on next swap).
-    function _processTickBucket(int24 tick, address token0, uint128 currentPrice, PoolKey calldata poolKey) internal {
-        uint256[] storage orderIdsInTick = tickToOrders[tick];
+    function _processTickBucket(PoolId poolId, int24 tick, uint128 currentPrice, PoolKey calldata poolKey) internal {
+        uint256[] storage orderIdsInTick = tickToOrders[poolId][tick];
 
         uint256 i = 0;
         while (i < orderIdsInTick.length) {
@@ -640,11 +656,8 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                 continue;
             }
 
-            // Skip if wrong pool
-            if (order.token0 != token0) {
-                i++;
-                continue;
-            }
+            // (H2) No token0 pool-filter needed: the bucket is namespaced by PoolId, so every
+            // order in it provably belongs to this pool (the old currency0-only check was unsound).
 
             // Check price eligibility (inlined for gas efficiency)
             bool eligible = false;
@@ -861,48 +874,59 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                    SORTED LINKED LIST OPERATIONS
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Initialize a pool's active-tick linked-list sentinels exactly once (H2).
+    /// @dev Idempotent; called from _afterInitialize and createLimitOrder so the list is
+    ///      always valid before any insert/walk (avoids the default-zero sentinel trap).
+    function _ensurePoolSentinels(PoolId poolId) internal {
+        if (!poolListInitialized[poolId]) {
+            nextActiveTick[poolId][SENTINEL_MIN] = SENTINEL_MAX;
+            prevActiveTick[poolId][SENTINEL_MAX] = SENTINEL_MIN;
+            poolListInitialized[poolId] = true;
+        }
+    }
+
     /// @notice Insert a tick into the sorted doubly-linked list
     /// @dev Walks forward from SENTINEL_MIN to find the correct sorted position.
     ///      For most use cases (few dozen active ticks), this is cheap.
     ///      Worst case: O(N) where N = number of active ticks.
     ///      Could be optimized with a hint parameter if needed for >1000 active ticks.
-    function _insertActiveTick(int24 tick) internal {
+    function _insertActiveTick(PoolId poolId, int24 tick) internal {
         // Walk from the lowest sentinel to find insertion point
         int24 cursor = SENTINEL_MIN;
-        while (nextActiveTick[cursor] != SENTINEL_MAX && nextActiveTick[cursor] < tick) {
-            cursor = nextActiveTick[cursor];
+        while (nextActiveTick[poolId][cursor] != SENTINEL_MAX && nextActiveTick[poolId][cursor] < tick) {
+            cursor = nextActiveTick[poolId][cursor];
         }
 
         // Insert between cursor and cursor.next
         // Before: cursor <-> cursorNext
         // After:  cursor <-> tick <-> cursorNext
-        int24 cursorNext = nextActiveTick[cursor];
+        int24 cursorNext = nextActiveTick[poolId][cursor];
 
-        nextActiveTick[cursor] = tick;
-        prevActiveTick[tick] = cursor;
-        nextActiveTick[tick] = cursorNext;
-        prevActiveTick[cursorNext] = tick;
+        nextActiveTick[poolId][cursor] = tick;
+        prevActiveTick[poolId][tick] = cursor;
+        nextActiveTick[poolId][tick] = cursorNext;
+        prevActiveTick[poolId][cursorNext] = tick;
 
-        isActiveTick[tick] = true;
+        isActiveTick[poolId][tick] = true;
     }
 
     /// @notice Remove a tick from the sorted doubly-linked list
     /// @dev O(1) operation - just unlink the node.
-    function _removeActiveTick(int24 tick) internal {
-        if (!isActiveTick[tick]) return;
+    function _removeActiveTick(PoolId poolId, int24 tick) internal {
+        if (!isActiveTick[poolId][tick]) return;
 
-        int24 prev = prevActiveTick[tick];
-        int24 next = nextActiveTick[tick];
+        int24 prev = prevActiveTick[poolId][tick];
+        int24 next = nextActiveTick[poolId][tick];
 
         // Before: prev <-> tick <-> next
         // After:  prev <-> next
-        nextActiveTick[prev] = next;
-        prevActiveTick[next] = prev;
+        nextActiveTick[poolId][prev] = next;
+        prevActiveTick[poolId][next] = prev;
 
         // Clean up
-        delete nextActiveTick[tick];
-        delete prevActiveTick[tick];
-        isActiveTick[tick] = false;
+        delete nextActiveTick[poolId][tick];
+        delete prevActiveTick[poolId][tick];
+        isActiveTick[poolId][tick] = false;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -960,8 +984,10 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         override
         returns (bytes4)
     {
-        lastTick[key.toId()] = tick;
-        sqrtPriceBaseline[key.toId()] = sqrtPriceX96;
+        PoolId poolId = key.toId();
+        lastTick[poolId] = tick;
+        sqrtPriceBaseline[poolId] = sqrtPriceX96;
+        _ensurePoolSentinels(poolId);
         return this.afterInitialize.selector;
     }
 
@@ -1051,6 +1077,8 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         LimitOrder storage order = orders[orderId];
         if (!order.isFilled) revert OrderNotFilled();
         if (ownerOf(orderId) != msg.sender) revert NotOrderCreator();
+        // H1: bind the claim to the order's real pool — reject a caller-supplied foreign pool
+        if (PoolId.unwrap(poolKey.toId()) != PoolId.unwrap(order.poolId)) revert PoolKeyMismatch();
 
         // Determine output
         address outputToken = order.zeroForOne ? order.token1 : order.token0;

@@ -470,18 +470,18 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         int24 sentinelMax = hook.SENTINEL_MAX();
 
         // Before any orders: SENTINEL_MIN -> SENTINEL_MAX
-        assertEq(hook.nextActiveTick(sentinelMin), sentinelMax, "Empty list should point min->max");
-        assertEq(hook.prevActiveTick(sentinelMax), sentinelMin, "Empty list should point max->min");
+        assertEq(hook.nextActiveTick(poolKey.toId(), sentinelMin), sentinelMax, "Empty list should point min->max");
+        assertEq(hook.prevActiveTick(poolKey.toId(), sentinelMax), sentinelMin, "Empty list should point max->min");
 
         vm.prank(alice);
         hook.createLimitOrder(poolKey, true, 1e18, 1.002e18);
 
         // Now there should be one active tick between sentinels
-        int24 firstActive = hook.nextActiveTick(sentinelMin);
+        int24 firstActive = hook.nextActiveTick(poolKey.toId(), sentinelMin);
         assertTrue(firstActive != sentinelMax, "Should have an active tick after create");
-        assertTrue(hook.isActiveTick(firstActive), "Tick should be marked active");
-        assertEq(hook.nextActiveTick(firstActive), sentinelMax, "First active -> SENTINEL_MAX");
-        assertEq(hook.prevActiveTick(firstActive), sentinelMin, "SENTINEL_MIN <- first active");
+        assertTrue(hook.isActiveTick(poolKey.toId(), firstActive), "Tick should be marked active");
+        assertEq(hook.nextActiveTick(poolKey.toId(), firstActive), sentinelMax, "First active -> SENTINEL_MAX");
+        assertEq(hook.prevActiveTick(poolKey.toId(), firstActive), sentinelMin, "SENTINEL_MIN <- first active");
     }
 
     /// @notice Verify that cancelling all orders at a tick removes it from list
@@ -493,7 +493,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         uint256 orderId = hook.createLimitOrder(poolKey, true, 1e18, 1.002e18);
 
         // Verify tick is active
-        int24 activeTick = hook.nextActiveTick(sentinelMin);
+        int24 activeTick = hook.nextActiveTick(poolKey.toId(), sentinelMin);
         assertTrue(activeTick != sentinelMax, "Tick should be in list");
 
         // Cancel the only order at that tick
@@ -501,8 +501,8 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         vm.stopPrank();
 
         // Tick should be removed from list
-        assertEq(hook.nextActiveTick(sentinelMin), sentinelMax, "Tick should be removed after cancel");
-        assertFalse(hook.isActiveTick(activeTick), "Tick should not be active after cancel");
+        assertEq(hook.nextActiveTick(poolKey.toId(), sentinelMin), sentinelMax, "Tick should be removed after cancel");
+        assertFalse(hook.isActiveTick(poolKey.toId(), activeTick), "Tick should not be active after cancel");
     }
 
     /// @notice Verify sorted insertion with multiple different trigger prices
@@ -519,13 +519,13 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
 
         // Walk the list and verify it's sorted ascending
         int24 prev = sentinelMin;
-        int24 current = hook.nextActiveTick(sentinelMin);
+        int24 current = hook.nextActiveTick(poolKey.toId(), sentinelMin);
         uint256 count = 0;
 
         while (current != sentinelMax) {
             assertTrue(current > prev || prev == sentinelMin, "List must be sorted ascending");
             prev = current;
-            current = hook.nextActiveTick(current);
+            current = hook.nextActiveTick(poolKey.toId(), current);
             count++;
         }
 
@@ -546,11 +546,11 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         vm.stopPrank();
 
         // Walk the list - should have exactly 1 active tick
-        int24 current = hook.nextActiveTick(sentinelMin);
+        int24 current = hook.nextActiveTick(poolKey.toId(), sentinelMin);
         uint256 count = 0;
         while (current != sentinelMax) {
             count++;
-            current = hook.nextActiveTick(current);
+            current = hook.nextActiveTick(poolKey.toId(), current);
         }
         assertEq(count, 1, "Same price orders should share one tick in the list");
     }
@@ -565,7 +565,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
 
         // Verify tick is in list
-        assertTrue(hook.nextActiveTick(sentinelMin) != sentinelMax, "Should have active tick");
+        assertTrue(hook.nextActiveTick(poolKey.toId(), sentinelMin) != sentinelMax, "Should have active tick");
 
         // Execute swap to fill the order
         token0.mint(address(this), 50e18);
@@ -597,7 +597,112 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
 
         // Tick should still be active (order2 remains)
         int24 tick = hook.getTickBucket(order2);
-        assertTrue(hook.isActiveTick(tick), "Tick should remain active with remaining order");
+        assertTrue(hook.isActiveTick(poolKey.toId(), tick), "Tick should remain active with remaining order");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        H1 + H2: POOL ISOLATION (audit hardening)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Spin up a second pool sharing currency0/currency1 but with a different fee tier
+    ///      (distinct PoolId), fully initialized and funded with liquidity.
+    function _setUpSecondPool() internal returns (PoolKey memory poolKeyB) {
+        poolKeyB = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 500,
+            tickSpacing: 10,
+            hooks: hook
+        });
+        manager.initialize(poolKeyB, TickMath.getSqrtPriceAtTick(0));
+
+        token0.mint(address(this), 10_000e18);
+        token1.mint(address(this), 10_000e18);
+        token0.approve(address(modifyLiquidityRouter), type(uint256).max);
+        token1.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKeyB,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -1200, tickUpper: 1200, liquidityDelta: 10_000e18, salt: bytes32(0)
+            }),
+            ""
+        );
+    }
+
+    /// @notice H2: an order in pool A must NOT be filled by a swap in a different pool B
+    ///         (both share currency0), and must still fill from its own pool's swap.
+    function test_H2_CrossPoolIsolation() public {
+        PoolKey memory poolKeyB = _setUpSecondPool();
+
+        // BUY-token0 order in pool A (fills on a price-down swap)
+        vm.prank(alice);
+        uint256 orderId = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
+        assertFalse(hook.getOrder(orderId).isFilled, "not filled at creation");
+
+        token0.mint(address(this), 100e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+
+        // Swap in pool B (price down) — must NOT touch pool A's order (H2 fix)
+        swapRouter.swap(
+            poolKeyB,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertFalse(hook.getOrder(orderId).isFilled, "H2: pool A order must NOT fill from a pool B swap");
+
+        // Swap in pool A — SHOULD fill it
+        swapRouter.swap(
+            poolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertTrue(hook.getOrder(orderId).isFilled, "order should fill from its own pool's swap");
+    }
+
+    /// @notice H1: claimOrder must reject a poolKey that doesn't match the order's pool,
+    ///         and accept the correct one.
+    function test_H1_ClaimOrder_RejectsForeignPoolKey() public {
+        // Create + fill a BUY-token0 order in pool A
+        vm.prank(alice);
+        uint256 orderId = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
+
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            poolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertTrue(hook.getOrder(orderId).isFilled, "order should be filled");
+
+        // A foreign poolKey (same tokens, different fee -> different PoolId) must revert
+        PoolKey memory foreignKey = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 500,
+            tickSpacing: 10,
+            hooks: hook
+        });
+        vm.prank(alice);
+        vm.expectRevert(ILAwareLimitOrderHook.PoolKeyMismatch.selector);
+        hook.claimOrder(orderId, foreignKey);
+
+        // The correct poolKey succeeds (no revert)
+        vm.prank(alice);
+        hook.claimOrder(orderId, poolKey);
+
+        // NFT burned after a successful claim — ownerOf reverts
+        vm.expectRevert();
+        hook.ownerOf(orderId);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -681,7 +786,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         hook.ownerOf(orderId);
 
         int24 tick = hook.getTickBucket(orderId);
-        assertFalse(hook.isActiveTick(tick), "Tick should be removed after force cancel");
+        assertFalse(hook.isActiveTick(poolKey.toId(), tick), "Tick should be removed after force cancel");
     }
 
     /// @notice Phase 3.14: Non-admin cannot force-cancel
