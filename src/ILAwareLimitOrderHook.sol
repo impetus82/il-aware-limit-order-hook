@@ -31,10 +31,10 @@ import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 ///   wastes gas on empty ticks and fails for large price movements), we maintain
 ///   a sorted doubly-linked list of only those ticks that actually contain orders.
 ///
-///   Storage layout:
-///     - `nextActiveTick[tick]` -> next higher active tick (or SENTINEL_MAX)
-///     - `prevActiveTick[tick]` -> next lower active tick (or SENTINEL_MIN)
-///     - Two sentinel values anchor the list boundaries
+///   Storage layout (per-pool since H2 — each pool has its own list):
+///     - `nextActiveTick[poolId][tick]` -> next higher active tick (or SENTINEL_MAX)
+///     - `prevActiveTick[poolId][tick]` -> next lower active tick (or SENTINEL_MIN)
+///     - Two sentinel values anchor each pool's list boundaries
 ///
 ///   This gives us:
 ///     - O(1) insertion: given the sorted position (found via binary hint or walk)
@@ -587,6 +587,9 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     ///      - zeroForOne swap (price DOWN) -> scan upward for BUY orders (trigger when price <= X)
     function _tryExecuteOrders(PoolKey calldata poolKey, uint128 currentPrice, bool swapZeroForOne) internal {
         PoolId poolId = poolKey.toId();
+        // Defense-in-depth: never walk an uninitialized list (self-defending against any
+        // future caller that reaches here for a pool that skipped _afterInitialize).
+        if (!poolListInitialized[poolId]) return;
 
         int24 activeTickCount = 0;
 
