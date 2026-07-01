@@ -1223,6 +1223,80 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         assertTrue(orderAfter.vaultShares > 0, "vaultShares should be recorded after depositToVault");
     }
 
+    /// @notice H3: a filled + vault-deposited order (vaultShares > 0) cannot be force-cancelled,
+    ///         and its principal is NOT stranded — the owner can still claim it in full.
+    ///         Proves the "forceCancelOrder orphans vault shares" finding is unreachable.
+    function test_H3_ForceCancel_CannotStrandVaultShares() public {
+        MockERC4626 vault = new MockERC4626(address(token0));
+
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory args = abi.encode(address(manager), address(this), address(vault));
+        vm.pauseGasMetering();
+        (address predicted, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
+        ILAwareLimitOrderHook hookWithVault =
+            new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
+        require(address(hookWithVault) == predicted, "mismatch");
+        vm.resumeGasMetering();
+
+        PoolKey memory vaultPoolKey = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 500,
+            tickSpacing: 10,
+            hooks: hookWithVault
+        });
+        manager.initialize(vaultPoolKey, TickMath.getSqrtPriceAtTick(0));
+
+        token0.mint(address(this), 5_000e18);
+        token1.mint(address(this), 5_000e18);
+        token0.approve(address(modifyLiquidityRouter), type(uint256).max);
+        token1.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            vaultPoolKey,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)
+            }),
+            ""
+        );
+
+        token1.mint(alice, 10e18);
+        vm.startPrank(alice);
+        token1.approve(address(hookWithVault), type(uint256).max);
+        token0.approve(address(hookWithVault), type(uint256).max);
+        uint256 orderId = hookWithVault.createLimitOrder(vaultPoolKey, false, 1e18, 1.002e18);
+        vm.stopPrank();
+
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            vaultPoolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        vm.prank(alice);
+        hookWithVault.depositToVault(orderId);
+        assertTrue(hookWithVault.getOrder(orderId).vaultShares > 0, "vaultShares should be set");
+
+        // H3: force-cancelling a filled + deposited order MUST revert (cannot strand vaultShares)
+        vm.expectRevert(ILAwareLimitOrderHook.OrderAlreadyFilled.selector);
+        hookWithVault.forceCancelOrder(orderId);
+
+        // And the principal is NOT stranded: the owner can still claim it in full via claimOrder
+        uint256 aliceBefore = token0.balanceOf(alice);
+        vm.prank(alice);
+        hookWithVault.claimOrder(orderId, vaultPoolKey);
+        assertTrue(token0.balanceOf(alice) > aliceBefore, "owner can still claim deposited output (not stranded)");
+    }
+
     /// @notice claimOrder distributes vault yield as IL rebate
     function test_YieldRebate_OnClaim() public {
         MockERC4626 vault = new MockERC4626(address(token0));

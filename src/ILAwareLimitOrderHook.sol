@@ -444,6 +444,14 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         if (order.isFilled) revert OrderAlreadyFilled();
         if (_ownerOf(orderId) == address(0)) revert OrderNotActive(); // burned = already cancelled
 
+        // H3 invariant: only UNFILLED orders reach here. `vaultShares` is set solely by
+        // depositToVault (which requires isFilled == true), and isFilled is monotonic (never
+        // reset), so any order with vaultShares > 0 is filled and reverts at the guard above.
+        // Therefore no vault redemption is needed here and no deposited principal can be
+        // stranded. A filled order's output is the owner's bearer claim, recoverable only via
+        // claimOrder (which redeems vaultShares) — admin intentionally cannot seize a filled
+        // position. (See test_H3_ForceCancel_CannotStrandVaultShares.)
+
         address recipient = ownerOf(orderId);
 
         // Remove from (pool, tick) bucket
