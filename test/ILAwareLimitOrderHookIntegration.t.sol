@@ -1874,6 +1874,11 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         assertGt(aliceReceived, outputAmount,
             "Alice should receive outputAmount + IL-rebate (yield covered impermanent loss)");
 
+        // M1/J2: the rebate is a bounded heuristic — it can NEVER exceed the realized vault yield,
+        // regardless of how the IL estimate is sized (output-notional heuristic) or of any
+        // triggering-price manipulation. rebate = min(yield, IL) <= yield, by construction.
+        assertLe(aliceReceived - outputAmount, expectedYield, "M1/J2: rebate must not exceed realized yield");
+
         // NFT burned after claim
         vm.expectRevert();
         hookWithVault.ownerOf(orderId);

@@ -1046,18 +1046,31 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         return (this.afterAddLiquidity.selector, BalanceDelta.wrap(0));
     }
 
-    /// @notice Oracle-free IL approximation using Taylor expansion of the Uniswap V2 IL formula
-    /// @dev IL ≈ (Δ√P / √P)² / 2 * liquidity. Valid for small price moves (<50%).
-    ///      For larger moves the approximation underestimates; acceptable for rebate sizing.
-    function _calculateIL(uint160 sqrtPriceEntry, uint160 sqrtPriceCurrent, uint128 liq)
+    /// @notice Oracle-free rebate-sizing HEURISTIC based on the Uniswap V2 IL curve.
+    /// @dev NOT a precise impermanent-loss figure. Returns `outputNotional * (Δ√P/√P)² / 2` —
+    ///      the V2-IL shape scaled by the order's OUTPUT NOTIONAL (a token amount) used purely as
+    ///      a sizing scalar. `outputNotional` is therefore NOT Uniswap liquidity `L` (the two are
+    ///      not dimensionally comparable, and tokens with more decimals scale it up); treat the
+    ///      result as an approximate, order-size-proportional rebate CEILING, valid only for small
+    ///      moves (<50%; it underestimates beyond).
+    ///
+    ///      SAFETY (M1 + J2): this value is consumed ONLY as the upper bound in
+    ///      `rebate = min(yieldEarned, ilAmount)` (claimOrder), and the payout is further capped at
+    ///      the vault's `redeemed` amount (RebateExceedsRedeemed guard). So however the heuristic is
+    ///      sized — and however the triggering/fill price is manipulated — the rebate can never
+    ///      exceed the user's own realized vault yield, and can never draw from other orders'
+    ///      custody or from fees. A precise on-chain IL / TWAP oracle was judged disproportionate
+    ///      precisely because the payout is yield-capped. `sqrtPriceCurrent` is the fill price
+    ///      captured BEFORE the hook's own internal swap (no self-inflicted skew).
+    function _calculateIL(uint160 sqrtPriceEntry, uint160 sqrtPriceCurrent, uint128 outputNotional)
         internal
         pure
         returns (uint256 ilAmount)
     {
-        if (sqrtPriceEntry == 0 || sqrtPriceCurrent == 0 || liq == 0) return 0;
+        if (sqrtPriceEntry == 0 || sqrtPriceCurrent == 0 || outputNotional == 0) return 0;
         uint256 sqrtR = (uint256(sqrtPriceCurrent) * 1e9) / uint256(sqrtPriceEntry);
         uint256 diff = sqrtR > 1e9 ? sqrtR - 1e9 : 1e9 - sqrtR;
-        ilAmount = (uint256(liq) * diff * diff) / (2 * 1e9 * 1e9);
+        ilAmount = (uint256(outputNotional) * diff * diff) / (2 * 1e9 * 1e9);
     }
 
     /// @notice Deposits the output of a filled limit order into the ERC-4626 yield vault
@@ -1105,7 +1118,10 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         uint256 outputAmount = order.zeroForOne ? uint256(order.amount1) : uint256(order.amount0);
         if (outputAmount == 0) revert OrderAlreadyClaimed();
 
-        // Calculate IL using pool baseline vs fill price (liquidity proxy = outputAmount)
+        // Rebate-sizing heuristic (see _calculateIL): pool-init baseline vs fill price, scaled by
+        // the order's output notional. This is an UPPER BOUND only — the actual rebate is
+        // min(yieldEarned, ilAmount), further capped at `redeemed` — so its precision never
+        // affects solvency (M1 + J2).
         PoolId poolId = poolKey.toId();
         uint256 ilAmount = _calculateIL(
             sqrtPriceBaseline[poolId],
