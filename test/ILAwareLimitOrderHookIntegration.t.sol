@@ -1950,4 +1950,86 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
 
         assertTrue(aliceAfter > aliceBefore, "Alice should receive output without vault");
     }
+
+    /*//////////////////////////////////////////////////////////////
+                    M4: HARD PRICE GATE TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice M4: a large SELL order on a shallow pool now fills only PARTIALLY within the
+    ///         trigger-anchored tolerance band and REFUNDS the unused input — instead of the old
+    ///         behaviour of filling the whole order at a price worse than the user's limit and
+    ///         emitting a "SlippageExceeded" warning. Proves the swap can never fill below
+    ///         triggerPrice*(1 - MAX_SLIPPAGE_BPS) (the hard gate).
+    function test_M4_HardGate_PartialFillProtectsPrice() public {
+        hook.setFeeBps(0); // clean gross-price math (owner == this test contract)
+
+        uint96 amountIn = 500e18; // >> the ~0.5% tolerance-band depth of the 10_000e18 pool
+        uint128 triggerPrice = 1.002e18;
+
+        vm.prank(alice);
+        uint256 orderId = hook.createLimitOrder(poolKey, true, amountIn, triggerPrice);
+        uint256 aliceT0AfterCreate = token0.balanceOf(alice);
+
+        // Push price up past the trigger (same proven trigger as testSellOrderExecution).
+        token1.mint(address(this), 60e18);
+        token1.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            poolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: false, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
+        assertTrue(order.isFilled, "Large order should be (partially) filled");
+
+        // Partial fill: unused input was refunded to the owner => the gate bound the swap.
+        uint256 refund = token0.balanceOf(alice) - aliceT0AfterCreate;
+        assertGt(refund, 0, "Gate must refund the unfillable remainder (partial fill)");
+        assertLt(refund, amountIn, "Some of the order must have filled");
+
+        uint256 actualInput = uint256(amountIn) - refund;
+        assertGt(actualInput, 0, "Some input must have been consumed");
+
+        // Hard-gate guarantee: realized price (token1 out / token0 in) >= trigger*(1 - slippage).
+        uint256 realizedScaled = uint256(order.amount1) * 1e18 / actualInput;
+        uint256 floor = uint256(triggerPrice) * (10000 - hook.MAX_SLIPPAGE_BPS()) / 10000;
+        assertGe(realizedScaled, floor, "Fill must never be below the trigger-tolerant floor");
+    }
+
+    /// @notice M4: a normal small order is unaffected — it fills FULLY (no refund) at
+    ///         trigger-or-better, so the tighter gate does not regress ordinary execution.
+    function test_M4_HardGate_SmallOrderFillsFully() public {
+        hook.setFeeBps(0);
+
+        uint96 amountIn = 1e18;
+        uint128 triggerPrice = 1.002e18;
+
+        vm.prank(alice);
+        uint256 orderId = hook.createLimitOrder(poolKey, true, amountIn, triggerPrice);
+        uint256 aliceT0AfterCreate = token0.balanceOf(alice);
+
+        token1.mint(address(this), 60e18);
+        token1.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            poolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: false, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
+        assertTrue(order.isFilled, "Small order should fully fill");
+
+        uint256 refund = token0.balanceOf(alice) - aliceT0AfterCreate;
+        assertEq(refund, 0, "A small order well within pool depth must not be refunded");
+
+        uint256 realizedScaled = uint256(order.amount1) * 1e18 / uint256(amountIn);
+        uint256 floor = uint256(triggerPrice) * (10000 - hook.MAX_SLIPPAGE_BPS()) / 10000;
+        assertGe(realizedScaled, floor, "Fill must respect the trigger-tolerant floor");
+    }
 }

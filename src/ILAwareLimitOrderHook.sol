@@ -745,13 +745,25 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         address orderOwner = ownerOf(orderId);
         uint96 amountIn = order.zeroForOne ? order.amount0 : order.amount1;
 
-        // Get current price for slippage limit
+        // Current pool price: used for the pre-swap price-gate check (Stage A) and recorded as the
+        // pre-internal-swap fill price for the IL rebate in claimOrder (order.sqrtPriceAtFill).
         (uint160 currentSqrtPriceX96,,,) = poolManager.getSlot0(poolKey.toId());
 
-        // Price limit: 5% slippage on the internal swap
-        uint160 sqrtPriceLimitX96 = order.zeroForOne
-            ? ((uint256(currentSqrtPriceX96) * 95) / 100).toUint160()
-            : ((uint256(currentSqrtPriceX96) * 105) / 100).toUint160();
+        // M4 HARD PRICE GATE: anchor the internal-swap limit to the ORDER's trigger price
+        // (± MAX_SLIPPAGE_BPS), NOT to spot. The swap then physically cannot execute worse than the
+        // user's price — replacing the old advisory "fill anyway on SlippageExceeded" behaviour.
+        // _tolerantSqrtLimit is non-reverting, so it is safe inside afterSwap.
+        uint160 sqrtPriceLimitX96 = _tolerantSqrtLimit(order.triggerPrice, order.zeroForOne);
+
+        // Stage A: if the limit already sits on the wrong side of spot, poolManager.swap would revert
+        // (PriceLimitAlreadyExceeded) — forbidden here, as it would DoS the user's swap. Skip instead:
+        // no swap is issued, so there is zero pool delta and the order simply stays resting. For a
+        // genuinely eligible order this is essentially unreachable (defensive guard).
+        if (order.zeroForOne ? sqrtPriceLimitX96 >= currentSqrtPriceX96 : sqrtPriceLimitX96 <= currentSqrtPriceX96) {
+            isExecuting = false;
+            emit OrderExecutionFailed(orderId, "PriceGate");
+            return false;
+        }
 
         IPoolManager.SwapParams memory swapParams = IPoolManager.SwapParams({
             zeroForOne: order.zeroForOne,
@@ -761,14 +773,24 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
 
         BalanceDelta swapDelta = poolManager.swap(poolKey, swapParams, "");
 
-        // Record fill price for IL calculation in claimOrder
+        // Record the pre-internal-swap price for the IL calculation in claimOrder.
         order.sqrtPriceAtFill = currentSqrtPriceX96;
 
-        // Settle input + Take output to this contract (output claimed via claimOrder)
+        // Settle input + take output to this contract (output claimed via claimOrder). Because the
+        // swap could not cross sqrtPriceLimitX96, every filled unit executed at trigger-or-better
+        // within tolerance; a large order may fill only partially (unused input is refunded).
         if (order.zeroForOne) {
             // swapDelta.amount0() is negative (hook owes token0 to pool)
             int128 deltaAmount0 = swapDelta.amount0();
             uint256 actualInput = uint256(uint128(-deltaAmount0));
+
+            // Stage B: the swap consumed nothing (hit the price gate immediately) => zero delta on
+            // both currencies. Skip clean, no settle/take, order stays resting for a later swap.
+            if (actualInput == 0) {
+                isExecuting = false;
+                emit OrderExecutionFailed(orderId, "PriceGate");
+                return false;
+            }
 
             poolManager.sync(poolKey.currency0);
             IERC20(order.token0).safeTransfer(address(poolManager), actualInput);
@@ -780,35 +802,6 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             uint256 feeAmount = (amountOut * feeBps) / 10000;
             uint256 netAmount = amountOut - feeAmount;
 
-            uint256 expectedOut = (uint256(amountIn) * uint256(order.triggerPrice)) / 1e18;
-            uint256 minAmountOut = (expectedOut * (10000 - MAX_SLIPPAGE_BPS)) / 10000;
-
-            if (amountOut < minAmountOut) {
-                // Slippage: still fill, emit warning. Output held in hook for claimOrder.
-                poolManager.take(poolKey.currency1, address(this), netAmount);
-                if (feeAmount > 0) {
-                    poolManager.take(poolKey.currency1, address(this), feeAmount);
-                    pendingFees[poolKey.currency1] += feeAmount;
-                    emit FeeCollected(orderId, poolKey.currency1, feeAmount);
-                }
-                order.isFilled = true;
-                order.amount1 = netAmount.toUint96();
-                uint256 refund = uint256(amountIn) - actualInput;
-                if (refund > 0) IERC20(order.token0).safeTransfer(orderOwner, refund);
-
-                emit OrderExecutionFailed(orderId, "SlippageExceeded");
-                emit OrderFilled(
-                    orderId,
-                    orderOwner,
-                    uint96(actualInput),
-                    netAmount.toUint96(),
-                    sqrtPriceToUint128(currentSqrtPriceX96)
-                );
-                isExecuting = false;
-                return true;
-            }
-
-            // Normal: output held in hook for claimOrder
             poolManager.take(poolKey.currency1, address(this), netAmount);
             if (feeAmount > 0) {
                 poolManager.take(poolKey.currency1, address(this), feeAmount);
@@ -817,12 +810,21 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             }
             order.isFilled = true;
             order.amount1 = netAmount.toUint96();
+            // Partial fill (order larger than pool depth within tolerance): refund unused input.
             uint256 refund0 = uint256(amountIn) - actualInput;
             if (refund0 > 0) IERC20(order.token0).safeTransfer(orderOwner, refund0);
+
+            emit OrderFilled(orderId, orderOwner, uint96(actualInput), netAmount.toUint96(), _executionPrice(currentSqrtPriceX96));
         } else {
             // swapDelta.amount1() is negative (hook owes token1 to pool)
             int128 deltaAmount1 = swapDelta.amount1();
             uint256 actualInput = uint256(uint128(-deltaAmount1));
+
+            if (actualInput == 0) {
+                isExecuting = false;
+                emit OrderExecutionFailed(orderId, "PriceGate");
+                return false;
+            }
 
             poolManager.sync(poolKey.currency1);
             IERC20(order.token1).safeTransfer(address(poolManager), actualInput);
@@ -834,35 +836,6 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             uint256 feeAmount = (amountOut * feeBps) / 10000;
             uint256 netAmount = amountOut - feeAmount;
 
-            uint256 expectedOut = (uint256(amountIn) * 1e18) / uint256(order.triggerPrice);
-            uint256 minAmountOut = (expectedOut * (10000 - MAX_SLIPPAGE_BPS)) / 10000;
-
-            if (amountOut < minAmountOut) {
-                // Slippage: still fill, output held in hook
-                poolManager.take(poolKey.currency0, address(this), netAmount);
-                if (feeAmount > 0) {
-                    poolManager.take(poolKey.currency0, address(this), feeAmount);
-                    pendingFees[poolKey.currency0] += feeAmount;
-                    emit FeeCollected(orderId, poolKey.currency0, feeAmount);
-                }
-                order.isFilled = true;
-                order.amount0 = netAmount.toUint96();
-                uint256 refund = uint256(amountIn) - actualInput;
-                if (refund > 0) IERC20(order.token1).safeTransfer(orderOwner, refund);
-
-                emit OrderExecutionFailed(orderId, "SlippageExceeded");
-                emit OrderFilled(
-                    orderId,
-                    orderOwner,
-                    uint96(actualInput),
-                    netAmount.toUint96(),
-                    sqrtPriceToUint128(currentSqrtPriceX96)
-                );
-                isExecuting = false;
-                return true;
-            }
-
-            // Normal: output held in hook for claimOrder
             poolManager.take(poolKey.currency0, address(this), netAmount);
             if (feeAmount > 0) {
                 poolManager.take(poolKey.currency0, address(this), feeAmount);
@@ -873,15 +846,9 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             order.amount0 = netAmount.toUint96();
             uint256 refund1 = uint256(amountIn) - actualInput;
             if (refund1 > 0) IERC20(order.token1).safeTransfer(orderOwner, refund1);
-        }
 
-        emit OrderFilled(
-            orderId,
-            orderOwner,
-            uint96(order.zeroForOne ? uint256(uint128(-swapDelta.amount0())) : uint256(uint128(-swapDelta.amount1()))),
-            order.zeroForOne ? order.amount1 : order.amount0,
-            sqrtPriceToUint128(currentSqrtPriceX96)
-        );
+            emit OrderFilled(orderId, orderOwner, uint96(actualInput), netAmount.toUint96(), _executionPrice(currentSqrtPriceX96));
+        }
 
         isExecuting = false;
         return true;
@@ -975,6 +942,48 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             y = z;
             z = (x / z + z) / 2;
         }
+    }
+
+    /// @notice Trigger-anchored, non-reverting sqrtPriceX96 limit for the internal fill swap (M4).
+    /// @dev SELL (zeroForOne) uses triggerPrice*(1 - MAX_SLIPPAGE_BPS) as a price FLOOR; BUY uses
+    ///      triggerPrice*(1 + MAX_SLIPPAGE_BPS) as a price CEILING. Mirrors uint128ToSqrtPrice's math
+    ///      but can NEVER revert — it runs inside afterSwap, where a revert would DoS the user's swap:
+    ///      the tolerant-price multiply fits uint256, the priceX96Full overflow is guarded (clamped to
+    ///      the correct pool bound), and the result is clamped into the swappable band
+    ///      [MIN_SQRT_PRICE+1, MAX_SQRT_PRICE-1]. Makes the swap physically unable to fill worse than
+    ///      the user's price, so no post-hoc slippage check is needed.
+    function _tolerantSqrtLimit(uint128 triggerPrice, bool zeroForOne) internal pure returns (uint160) {
+        // uint256(triggerPrice) * 10050 <= ~3.42e42 << 2^256 → the tolerant-price multiply is safe.
+        uint256 tolPrice = zeroForOne
+            ? (uint256(triggerPrice) * (10000 - MAX_SLIPPAGE_BPS)) / 10000
+            : (uint256(triggerPrice) * (10000 + MAX_SLIPPAGE_BPS)) / 10000;
+
+        // priceX192 = tolPrice * 2^96 / 1e18. tolPrice <= ~2^128 so tolPrice << 96 <= ~2^224, safe.
+        uint256 priceX192 = (tolPrice * (1 << 96)) / 1e18;
+
+        // priceX192 << 96 overflows uint256 only for prices that map ABOVE MAX_SQRT_PRICE anyway;
+        // clamp to the pool bound on the CORRECT side (floor for SELL, ceiling for BUY), not revert.
+        if (priceX192 > (type(uint256).max >> 96)) {
+            return zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+        }
+        uint256 sqrtRaw = sqrt(priceX192 << 96);
+
+        // PoolManager rejects a limit <= MIN or >= MAX; clamp into the swappable band.
+        if (sqrtRaw <= TickMath.MIN_SQRT_PRICE) return TickMath.MIN_SQRT_PRICE + 1;
+        if (sqrtRaw >= TickMath.MAX_SQRT_PRICE) return TickMath.MAX_SQRT_PRICE - 1;
+        return uint160(sqrtRaw);
+    }
+
+    /// @notice Saturating sqrtPriceX96 → uint128 price for event fields only (never reverts).
+    /// @dev Used for the OrderFilled executionPrice so an extreme-price pool cannot revert (DoS) the
+    ///      fill path inside afterSwap. Accounting paths keep the reverting sqrtPriceToUint128.
+    function _executionPrice(uint160 sqrtPriceX96) internal pure returns (uint128) {
+        uint256 sqrtPrice = uint256(sqrtPriceX96);
+        // sqrtPrice^2 overflows uint256 once sqrtPrice > uint128 max; such a pool's price is
+        // astronomically high, so saturate rather than revert.
+        if (sqrtPrice > type(uint128).max) return type(uint128).max;
+        uint256 priceScaled = ((sqrtPrice * sqrtPrice) / (1 << 96) * 1e18) / (1 << 96);
+        return priceScaled > type(uint128).max ? type(uint128).max : uint128(priceScaled);
     }
 
     /// @notice Align a tick to the nearest multiple of tickSpacing (round down)
