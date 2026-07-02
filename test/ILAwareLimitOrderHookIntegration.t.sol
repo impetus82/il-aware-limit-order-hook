@@ -281,6 +281,34 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         hook.createLimitOrder(badPoolKey, true, 1e18, 1e18);
     }
 
+    /// @notice L1: a triggerPrice large enough to panic (0x11) inside uint128ToSqrtPrice is now
+    ///         rejected cleanly with InvalidTriggerPrice, before any token transfer or mint.
+    ///         (type(uint128).max previously caused an opaque arithmetic-overflow panic.)
+    function test_L1_RejectsExcessiveTriggerPrice() public {
+        vm.prank(alice);
+        vm.expectRevert(ILAwareLimitOrderHook.InvalidTriggerPrice.selector);
+        hook.createLimitOrder(poolKey, true, 1e18, type(uint128).max);
+    }
+
+    /// @notice L1: boundary — one wei above the cap is rejected.
+    function test_L1_RejectsJustAboveMaxTriggerPrice() public {
+        uint128 tooHigh = hook.MAX_TRIGGER_PRICE() + 1;
+        vm.prank(alice);
+        vm.expectRevert(ILAwareLimitOrderHook.InvalidTriggerPrice.selector);
+        hook.createLimitOrder(poolKey, true, 1e18, tooHigh);
+    }
+
+    /// @notice L1: boundary — the cap itself is accepted and passes through
+    ///         uint128ToSqrtPrice/getTickAtSqrtPrice without panic, so the bound never
+    ///         over-restricts a legitimate (if extreme) order.
+    function test_L1_AcceptsMaxTriggerPrice() public {
+        uint128 cap = hook.MAX_TRIGGER_PRICE();
+        vm.prank(alice);
+        uint256 orderId = hook.createLimitOrder(poolKey, true, 1e18, cap);
+        assertEq(hook.ownerOf(orderId), alice, "order at MAX_TRIGGER_PRICE should be created");
+        assertEq(hook.getOrder(orderId).triggerPrice, cap, "triggerPrice should be stored");
+    }
+
     /*//////////////////////////////////////////////////////////////
                         CANCELLATION TESTS
     //////////////////////////////////////////////////////////////*/

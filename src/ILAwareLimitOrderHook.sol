@@ -212,6 +212,16 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice Maximum allowed slippage in basis points (50 = 0.5%)
     uint256 public constant MAX_SLIPPAGE_BPS = 50;
 
+    /// @notice Upper bound on `triggerPrice` (1e18-scaled) accepted by createLimitOrder (L1).
+    /// @dev Set well below (~18x margin) both the `uint128ToSqrtPrice` overflow point
+    ///      (~2^64·1e18 ≈ 1.84e37, where `priceX192 * 2^96` would panic 0x11 at order creation)
+    ///      and the `_tolerantSqrtLimit` clamp point (~1.83e37, above which the M4 price gate
+    ///      would clamp to a pool bound and lose its floor/ceiling protection). 1e36 (an actual
+    ///      price of 1e18) is astronomically above any realistic pair (e.g. WETH/USDC ~3.6e21),
+    ///      so no legitimate order is rejected, while every accepted order stays in the exact,
+    ///      non-degenerate range of the sqrt-price math.
+    uint128 public constant MAX_TRIGGER_PRICE = 1e36;
+
     /*//////////////////////////////////////////////////////////////
                     IL-AWARE ADDITIONS (UHI9 Hookathon)
     //////////////////////////////////////////////////////////////*/
@@ -350,6 +360,9 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     {
         if (amountIn == 0) revert InvalidAmount();
         if (triggerPrice == 0) revert InvalidTriggerPrice();
+        // L1: reject prices that would panic (0x11) in uint128ToSqrtPrice below, or later reach the
+        // M4 gate's overflow clamp. Fails cleanly here, before any token transfer or mint.
+        if (triggerPrice > MAX_TRIGGER_PRICE) revert InvalidTriggerPrice();
         if (poolKey.tickSpacing <= 0) revert InvalidPoolKey();
 
         orderId = nextOrderId++;
