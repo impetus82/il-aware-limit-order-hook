@@ -2,7 +2,7 @@
 
 **Prepared for:** external audit firm
 **Contact:** egoshin_crypto@proton.me
-**Repository state:** branch `fix/pool-isolation-h1-h2`, all 8 findings + L1 fixed, 71 tests passing.
+**Repository state:** branch `fix/pool-isolation-h1-h2`, all findings (H1–M4, J1, J2) + L1 fixed, 70 tests passing.
 **Compiler:** Solidity `0.8.26`, `via-IR`, EVM `cancun`, optimizer on (`runs = 200`).
 
 ---
@@ -83,10 +83,10 @@ function claimOrder(uint256 orderId, PoolKey poolKey) external;   // PoolKey is 
 
 ### 4.4 Liquidity providers (LPs)
 
-- `afterAddLiquidity` records **informational telemetry only** (`lpPositions`) when an LP passes
-  `abi.encode(lpAddress)` as `hookData`. **This telemetry is spoofable and is never used for payouts or
-  access control** (see J1 in §9). LPs interact with the pool normally; the hook takes no LP funds and
-  returns a zero delta from `afterAddLiquidity`.
+- `afterAddLiquidity` is a **no-op** and returns a zero delta. LPs interact with the pool normally; the
+  hook takes no LP funds. The earlier spoofable `lpPositions` / `getLPPosition` telemetry (populated from
+  unauthenticated `hookData`, never read for any payout or access-control path) has been **removed**
+  (finding J1, §8); the permission flag is retained only to keep the deployed hook address valid.
 
 ### 4.5 Hook owner / admin (`Ownable`)
 
@@ -199,7 +199,7 @@ its message):
 | **M2** | MED | `pendingFees` + order outputs share one balance → fee withdrawal could eat principal | Structural guard: vault-path payout reverts `RebateExceedsRedeemed` if it would exceed what the vault just delivered; solvency tests + invariant |
 | **M3** | MED | Unbounded per-tick arrays; linear-scan cancel/forceCancel → griefing DoS | `orderBucketIndex` + `_removeFromBucket` O(1) swap-and-pop; cancel/forceCancel have no loop |
 | **M4** | MED | Fixed 5% internal-swap limit + advisory slippage → orders could close worse than trigger | Hard price gate: internal-swap limit anchored to `triggerPrice` (± 0.5%) via non-reverting `_tolerantSqrtLimit`; forced-fill blocks deleted; two provably zero-delta skip paths |
-| **J1** | LOW | LP identity via `hookData` is spoofable | Accepted (see §9) — `lpPositions` is dead telemetry, never gates payouts |
+| **J1** | LOW | LP identity via `hookData` is spoofable | **Removed** — deleted the dead `lpPositions` / `getLPPosition` telemetry; `afterAddLiquidity` is now a no-op (flag retained to keep the deployed hook address valid) |
 | **J2** | LOW | IL uses instantaneous spot (no TWAP) → sandwich can inflate computed IL | Accepted (see §9) — `min(yield, IL)` cap + `RebateExceedsRedeemed` bound it to the user's own yield; `sqrtPriceAtFill` captured pre-internal-swap |
 | **L1** | LOW | Extreme `triggerPrice` could panic in `uint128ToSqrtPrice` / defeat the M4 gate | `MAX_TRIGGER_PRICE = 1e36` bound in `createLimitOrder` (clean revert before any transfer/mint); makes the M4 overflow clamp dead code for every creatable order |
 
@@ -210,38 +210,30 @@ its message):
 These are documented, understood, and accepted as of this submission. **None causes fund loss beyond the
 affected user's own funds**; all are candidate items for the auditor to independently re-confirm.
 
-1. **`lpPositions` / J1 — spoofable telemetry (deliberately NOT removed).** `afterAddLiquidity` still
-   populates `lpPositions[poolId][lp]` from caller-supplied `hookData`, and `getLPPosition` still exposes
-   it. This data is **informational only** — it is never read for payouts, rebate sizing, or access
-   control (all payouts gate on `ownerOf` + the `min(yield, IL)` rebate cap). It is spoofable (anyone can
-   claim any LP identity), but spoofing it changes nothing on-chain. J1's planned deletion was **not**
-   performed; the code path is retained. *Auditor action: confirm no code path consumes `lpPositions` for
-   value.*
-
-2. **`MIN_ORDER_SIZE` deferred (decimals footgun).** No minimum order size is enforced. A single global
+1. **`MIN_ORDER_SIZE` deferred (decimals footgun).** No minimum order size is enforced. A single global
    constant cannot serve both 6-decimal USDC (the live `currency0`) and 18-decimal tokens (`1e15` would
    impose a ~$1B floor on USDC). Anti-dust griefing is instead mitigated by M3's O(1) removal + the
    per-swap gas budget + the real transfer/mint cost of each order. A per-pool/decimal-aware floor is the
    correct future fix.
 
-3. **`netAmount.toUint96()` revert edge (fail-closed).** In `_executeOrder`, a single-order net output
+2. **`netAmount.toUint96()` revert edge (fail-closed).** In `_executeOrder`, a single-order net output
    above ~7.9e28 wei (`type(uint96).max`) would revert the cast. This is **unreachable** for any
    realistic order/pool and is **fail-closed** (reverts rather than silently truncating); it is not
    introduced by any fix. It could, in principle, block that one order's fill on an absurdly large output.
 
-4. **`sqrtPriceToUint128` panic on an extreme own-pool.** The reverting price helper used for
+3. **`sqrtPriceToUint128` panic on an extreme own-pool.** The reverting price helper used for
    `afterSwap` eligibility panics (`0x11`) when computing `sqrtPrice²` for a pool priced above
    ~1.85e19. This is a **self-DoS confined to a griefer's OWN hook-attached pool** — H1/H2 pool
    isolation means it cannot affect any other pool's orders or swaps. Event fields use the saturating
    `_executionPrice` helper instead, so the *fill* path does not inherit this revert.
 
-5. **Partial fills close + refund (no re-queue).** A genuinely eligible order that is larger than the
+4. **Partial fills close + refund (no re-queue).** A genuinely eligible order that is larger than the
    pool depth within tolerance fills **partially at trigger-or-better**, refunds the unused input, and
    **closes** — the remainder is **not** re-queued. Re-queuing was rejected because it would overload the
    output-holding `amount0`/`amount1` fields and risk the M2 solvency accounting. This is a UX decision,
    not a safety issue.
 
-6. **IL rebate is a bounded heuristic, not precise IL.** `_calculateIL` returns a 2nd-order Taylor
+5. **IL rebate is a bounded heuristic, not precise IL.** `_calculateIL` returns a 2nd-order Taylor
    (Uniswap-V2 IL-curve) approximation scaled by the order's output notional — valid only for small
    moves (< ~50%), decimals-sensitive, and referenced against the never-updated pool-init
    `sqrtPriceBaseline`. It is used **only** as the upper bound in `rebate = min(yieldEarned, ilAmount)`,
@@ -250,7 +242,7 @@ affected user's own funds**; all are candidate items for the auditor to independ
    from other orders' custody or from fees. The **precision** of the displayed rebate is a disclosed UX
    limitation; the **safety** is structural (M1 + J2 + M2).
 
-7. **M4 overflow clamp is dead code post-L1.** `_tolerantSqrtLimit`'s `priceX192 > type(uint256).max >> 96`
+6. **M4 overflow clamp is dead code post-L1.** `_tolerantSqrtLimit`'s `priceX192 > type(uint256).max >> 96`
    overflow clamp can no longer be reached by any creatable order, because L1's `MAX_TRIGGER_PRICE = 1e36`
    sits ~18× below the clamp threshold (~1.83e37). It is retained as defense-in-depth.
 
@@ -290,7 +282,7 @@ affected user's own funds**; all are candidate items for the auditor to independ
 # Build the contract
 forge build
 
-# Run the full suite (64 unit + 7 invariants = 71 tests)
+# Run the full suite (63 unit/integration + 7 invariants = 70 tests)
 forge test -vvv
 
 # Invariant suite only (Phase-2 solvency / pool-isolation / vault-share invariants)
@@ -301,5 +293,25 @@ Invariant config (in `foundry.toml`): `runs = 128`, `depth = 48`, `fail_on_rever
 (intentional — the handler tolerates reverting sub-calls so the graceful-skip and vault-failure paths
 are exercised under the invariants).
 
-**Current status: 71 tests passing** (64 unit + 7 Phase-2 invariants: solvency, pool-isolation /
-bucket-hygiene, vault-share consistency).
+**Current status: 70 tests passing** (63 unit/integration + 7 Phase-2 invariants: solvency,
+pool-isolation / bucket-hygiene, vault-share consistency).
+
+---
+
+## 12. Static analysis (Slither)
+
+Slither `0.11.5` was run over the in-scope contract (`slither . --filter-paths "lib/|test/|script/|frontend/"`).
+It produced **26 results, none a real issue** — each was triaged as a false-positive or an intentional,
+documented pattern:
+
+| Detector | Where | Triage |
+|----------|-------|--------|
+| `uninitialized-state` | `tickToOrders` | False positive — a `mapping` is populated by index (`.push` in `createLimitOrder`), never "initialized" wholesale |
+| `divide-before-multiply` (×5) | `sqrtPriceToUint128`, `uint128ToSqrtPrice`, `_tolerantSqrtLimit`, `_executionPrice`, `_alignTick` | Intentional fixed-point (Q64.96) and tick-alignment math; precision behaviour is understood and documented |
+| `reentrancy` (benign, ×3) | `_processTickBucket`, `_tryExecuteOrders` | State updates after `poolManager` calls inside the execution loop, which is guarded by `nonReentrant` + the `isExecuting` flag (see THREAT_MODEL §3.3–3.4) |
+| `unused-return` (×3) | `_afterSwap`/`_executeOrder` `getSlot0`; `_executeOrder` `settle()` | Intentional — only the needed slot0 fields are used; `settle()`'s return is not needed (standard v4 pattern) |
+| `missing-zero-address` | constructor `_yieldVault` | Intentional — `address(0)` is the valid "no vault" mode, checked before every vault call |
+| `dead-code` (×2) | `_tolerantSqrtLimit`, `_executionPrice` | False positive (via-IR inlining artifact) — both are called in `_executeOrder` (lines ~798 and ~859/892) and are covered by the M4 tests |
+| `cyclomatic-complexity` | `_executeOrder` | Informational |
+
+*Auditor action: independently re-run and re-confirm the triage; nothing here required a code change.*

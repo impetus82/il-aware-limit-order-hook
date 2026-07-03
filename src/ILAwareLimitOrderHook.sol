@@ -229,18 +229,6 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice ERC-4626 vault for earning yield on idle order liquidity
     address public immutable yieldVault;
 
-    /// @notice LP position data recorded at liquidity addition time
-    struct LPPosition {
-        uint160 sqrtPriceAtEntry;
-        uint128 liquidity;
-        uint256 entryTimestamp;
-        uint256 idleAmount;
-        uint256 vaultShares;
-    }
-
-    /// @notice LP position per pool per LP address (populated via afterAddLiquidity + hookData)
-    mapping(PoolId => mapping(address => LPPosition)) public lpPositions;
-
     /// @notice Last known tick per pool, initialized in afterInitialize and updated after each swap
     mapping(PoolId => int24) public lastTick;
 
@@ -344,7 +332,8 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Declare which hook callbacks this contract implements
-    /// @dev UHI9: added afterAddLiquidity + afterAddLiquidityReturnDelta for IL tracking
+    /// @dev afterAddLiquidity(+ReturnDelta) are retained as no-op callbacks (J1 removed the LP
+    ///      telemetry that used them); the flags are kept so the deployed hook address stays valid
     /// @return The Hooks.Permissions enabling afterInitialize, afterAddLiquidity(+ReturnDelta),
     ///         beforeSwap(+ReturnDelta), and afterSwap(+ReturnDelta)
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
@@ -611,17 +600,6 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @return The accumulated pendingFees for `currency`
     function getPendingFees(Currency currency) external view returns (uint256) {
         return pendingFees[currency];
-    }
-
-    /// @notice Get LP position data for a specific pool and LP address.
-    /// @dev INFORMATIONAL TELEMETRY ONLY. `lpPositions` is populated from spoofable
-    ///      `afterAddLiquidity` hookData (finding J1) and is NEVER used for payouts, rebate sizing,
-    ///      eligibility, or access control. Do not rely on it for accounting.
-    /// @param poolId The pool to query
-    /// @param lp The LP address to query
-    /// @return The recorded (spoofable) LPPosition telemetry
-    function getLPPosition(PoolId poolId, address lp) external view returns (LPPosition memory) {
-        return lpPositions[poolId][lp];
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1116,29 +1094,19 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    /// @notice Records LP entry price and liquidity when liquidity is added
-    /// @dev LP must pass abi.encode(realLP) as hookData; without it IL tracking is skipped (graceful degradation)
+    /// @notice No-op afterAddLiquidity callback.
+    /// @dev J1: the previous `lpPositions` telemetry (recorded from spoofable, unauthenticated
+    ///      `hookData`) was removed — it was never read for payouts, rebate sizing, eligibility, or
+    ///      access control, so it was dead attack surface. The permission flag is retained (so the
+    ///      deployed hook address stays valid) and the callback simply returns a zero delta.
     function _afterAddLiquidity(
         address,
-        PoolKey calldata key,
-        IPoolManager.ModifyLiquidityParams calldata params,
+        PoolKey calldata,
+        IPoolManager.ModifyLiquidityParams calldata,
         BalanceDelta,
         BalanceDelta,
-        bytes calldata hookData
+        bytes calldata
     ) internal override returns (bytes4, BalanceDelta) {
-        if (hookData.length >= 32) {
-            address realLP = abi.decode(hookData, (address));
-            if (realLP != address(0) && params.liquidityDelta > 0) {
-                (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(key.toId());
-                lpPositions[key.toId()][realLP] = LPPosition({
-                    sqrtPriceAtEntry: sqrtPriceX96,
-                    liquidity: uint128(uint256(params.liquidityDelta)),
-                    entryTimestamp: block.timestamp,
-                    idleAmount: 0,
-                    vaultShares: 0
-                });
-            }
-        }
         return (this.afterAddLiquidity.selector, BalanceDelta.wrap(0));
     }
 

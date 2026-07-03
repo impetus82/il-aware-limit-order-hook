@@ -154,7 +154,7 @@ This hook addresses that loss with a two-sided mitigation:
 |-------|-------------------|----------------|
 | Order creator | Receives output tokens, no yield while waiting | Output earns yield in ERC-4626 vault |
 | Order creator after fill | Receives exactly `amountOut`, no IL recovery | Receives `amountOut + min(yield, IL)` |
-| LP providing liquidity | Earns fees, suffers full IL from limit executions | Unchanged — the hook takes no LP funds (`lpPositions` is spoofable off-chain telemetry, **not** a trusted feed; see below) |
+| LP providing liquidity | Earns fees, suffers full IL from limit executions | Unchanged — the hook takes no LP funds (the spoofable `lpPositions` telemetry was **removed**, finding J1) |
 
 The rebate formula `rebate = min(yield, ilAmount)` ensures:
 - The creator can never receive **more** than their actual IL (no windfall)
@@ -171,10 +171,10 @@ shares), emits `VaultRedeemFailed`, and lets the owner re-claim once the vault r
 failure can neither make the hook insolvent nor trap a user's funds. These properties are checked under
 random sequences by the Phase-2 [invariant suite](#security--audit).
 
-> **`lpPositions` is spoofable telemetry, not a trusted feed (finding J1).** `afterAddLiquidity` records
-> an `LPPosition` from caller-supplied `hookData`, so any caller can forge any LP's entry. It is
-> **informational only** — no payout, rebate, eligibility, or access-control path reads it. Do not rely
-> on it for accounting or rebate programs.
+> **Finding J1 — resolved.** An earlier `lpPositions` map recorded LP identities from unauthenticated
+> `hookData` (spoofable, and never read for any payout, rebate, eligibility, or access-control path). It
+> has been **removed** along with `getLPPosition`; `afterAddLiquidity` is now a no-op. The permission
+> flag is retained only so the deployed hook address stays valid.
 
 ---
 
@@ -185,7 +185,7 @@ All 7 flags are enabled:
 | Flag | Bit | Purpose |
 |------|-----|---------|
 | `afterInitialize` | 12 | Record `lastTick` and `sqrtPriceBaseline` at pool creation |
-| `afterAddLiquidity` | 10 | Record spoofable off-chain LP telemetry from `hookData` (**not** used for IL math or payouts — see J1) |
+| `afterAddLiquidity` | 10 | No-op (flag retained; the spoofable LP telemetry it once recorded was removed — J1) |
 | `beforeSwap` | 7 | Passthrough (required for `beforeSwapReturnDelta`) |
 | `afterSwap` | 6 | Execute eligible orders, update `lastTick` |
 | `beforeSwapReturnDelta` | 3 | Reserved for a future dynamic-fee pathway |
@@ -252,11 +252,15 @@ Every finding from the hackathon judge feedback and an independent audit-prep sc
 | **M2** | MED | `pendingFees` + order outputs shared one balance | Structural guard: vault-path payout reverts `RebateExceedsRedeemed` if it exceeds redeemed; solvency tests |
 | **M3** | MED | Unbounded per-tick arrays → O(n) cancel/forceCancel griefing DoS | O(1) swap-and-pop via `orderBucketIndex` |
 | **M4** | MED | Fixed ±5% advisory slippage → orders could fill worse than trigger | Hard price gate anchored to `triggerPrice` (± 0.5%); skip-and-rest; forced-fill blocks deleted |
+| **J1** | LOW | LP identity via `hookData` is spoofable | **Removed** the dead `lpPositions` / `getLPPosition` telemetry; `afterAddLiquidity` is now a no-op (flag kept to preserve the deployed hook address) |
 | **J2** | LOW | IL uses spot price, no TWAP | Accepted — `min(yield, IL)` + `redeemed` caps bound it to the user's own yield; documented |
 | **L1** | LOW | Extreme `triggerPrice` could panic / defeat the M4 gate | `MAX_TRIGGER_PRICE = 1e36` bound (clean revert before any state change) |
 
-**J1** (spoofable `lpPositions` telemetry) is a **documented accepted risk** — it is never read for
-payouts or access control (see the note in [Who Bears the IL Risk?](#who-bears-the-il-risk)).
+**Static analysis:** Slither 0.11.5 was run over the contract; all findings were triaged as
+false-positives or intentional patterns (mappings reported "uninitialized" but populated by index;
+deliberate divide-before-multiply in the fixed-point price/tick math; benign reentrancy already guarded
+by `nonReentrant` + the `isExecuting` flag; intentional `address(0)` = no-vault mode). No real issue was
+found. Full triage in [docs/AUDIT_SCOPE.md](docs/AUDIT_SCOPE.md).
 
 ### Invariants (Phase-2 Foundry suite)
 
@@ -326,7 +330,7 @@ Pool init tx: [0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a
 ## Testing
 
 ```bash
-# Run all 71 tests
+# Run all 70 tests
 forge test -vvv
 
 # Unit tests (pure functions, no deployment)
@@ -342,7 +346,7 @@ forge test --match-path test/ILAwareLimitOrderHookInvariant.t.sol -vvv
 forge test --gas-report
 ```
 
-**Test coverage:** 71 tests — 71 passing, 0 failing (64 unit/integration + 7 Phase-2 invariants).
+**Test coverage:** 70 tests — 70 passing, 0 failing (63 unit/integration + 7 Phase-2 invariants).
 
 Key scenarios covered:
 - `test_AfterInitialize` — baseline price recorded at pool creation
@@ -372,7 +376,7 @@ Key scenarios covered:
 |   +-- RecoverPool.s.sol
 |-- test/
 |   |-- ILAwareLimitOrderHook.t.sol              # Unit tests (5 tests)
-|   |-- ILAwareLimitOrderHookIntegration.t.sol   # Integration tests (59 tests)
+|   |-- ILAwareLimitOrderHookIntegration.t.sol   # Integration tests (58 tests)
 |   +-- ILAwareLimitOrderHookInvariant.t.sol     # Phase-2 Foundry invariants (solvency / isolation / vault shares)
 |-- docs/
 |   |-- AUDIT_SCOPE.md                           # Audit scope, actors, assets at risk, accepted risks

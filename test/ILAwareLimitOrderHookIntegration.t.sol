@@ -1264,41 +1264,26 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         assertTrue(tickAfter >= tickBefore, "lastTick should increase after price-up swap");
     }
 
-    /// @notice Verifies lpPositions are recorded when hookData contains the LP address
-    function test_AfterAddLiquidity_WithHookData() public {
-        address lpAddress = makeAddr("lp_provider");
-
+    /// @notice J1: afterAddLiquidity is now a no-op (the spoofable `lpPositions` telemetry was
+    ///         removed). Adding liquidity — with or without an LP address in hookData — still
+    ///         succeeds and writes no hook state; the retained flag keeps the callback valid.
+    function test_AfterAddLiquidity_NoOp_Graceful() public {
         token0.mint(address(this), 1000e18);
         token1.mint(address(this), 1000e18);
         token0.approve(address(modifyLiquidityRouter), type(uint256).max);
         token1.approve(address(modifyLiquidityRouter), type(uint256).max);
+        uint256 t0Before = token0.balanceOf(address(this));
 
+        // hookData carrying an LP address is accepted but ignored by the no-op callback (no revert).
         modifyLiquidityRouter.modifyLiquidity(
             poolKey,
             IPoolManager.ModifyLiquidityParams({
                 tickLower: -600, tickUpper: 600, liquidityDelta: 1000e18, salt: bytes32(0)
             }),
-            abi.encode(lpAddress)
+            abi.encode(makeAddr("lp_provider"))
         );
 
-        PoolId poolId = poolKey.toId();
-        ILAwareLimitOrderHook.LPPosition memory pos = hook.getLPPosition(poolId, lpAddress);
-
-        assertTrue(pos.sqrtPriceAtEntry > 0, "sqrtPriceAtEntry should be recorded");
-        assertEq(pos.liquidity, uint128(1000e18), "liquidity should match liquidityDelta");
-        assertEq(pos.entryTimestamp, block.timestamp, "entryTimestamp should be current block");
-    }
-
-    /// @notice Verifies that LP tracking is skipped gracefully when hookData is empty
-    function test_AfterAddLiquidity_NoHookData_Graceful() public {
-        address lpAddress = makeAddr("unknown_lp");
-
-        // setUp already called addLiquidity() with empty hookData — no lpPositions recorded
-        PoolId poolId = poolKey.toId();
-        ILAwareLimitOrderHook.LPPosition memory pos = hook.getLPPosition(poolId, lpAddress);
-
-        assertEq(pos.sqrtPriceAtEntry, 0, "No tracking without hookData");
-        assertEq(pos.liquidity, 0, "No liquidity recorded without hookData");
+        assertLt(token0.balanceOf(address(this)), t0Before, "liquidity add still succeeds through the no-op hook");
     }
 
     /*//////////////////////////////////////////////////////////////
