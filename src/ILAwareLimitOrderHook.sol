@@ -87,7 +87,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice Thrown when order amount is zero
     error InvalidAmount();
 
-    /// @notice Thrown when trigger price is zero
+    /// @notice Thrown when trigger price is zero or exceeds MAX_TRIGGER_PRICE (L1)
     error InvalidTriggerPrice();
 
     /// @notice Thrown when a non-creator tries to cancel an order
@@ -264,12 +264,27 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                               EVENTS
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Emitted when a limit order is created and its input token is escrowed in the hook.
+    /// @param orderId The new order id (also the ERC-721 tokenId)
+    /// @param creator The minter / initial NFT owner
+    /// @param zeroForOne Sell token0 for token1 (true) or buy token0 with token1 (false)
+    /// @param amountIn The input amount escrowed
+    /// @param triggerPrice The 1e18-scaled trigger price (token1 per token0)
     event OrderCreated(
         uint256 indexed orderId, address indexed creator, bool zeroForOne, uint96 amountIn, uint128 triggerPrice
     );
 
+    /// @notice Emitted when an order is cancelled by its owner and the deposit is refunded.
+    /// @param orderId The cancelled order
+    /// @param creator The NFT owner who cancelled (refund recipient)
     event OrderCancelled(uint256 indexed orderId, address indexed creator);
 
+    /// @notice Emitted when an order is filled via the internal swap (fully or partially).
+    /// @param orderId The filled order
+    /// @param creator The NFT owner at fill time
+    /// @param amountIn Input actually consumed by the fill (may be < the original amount on a partial fill)
+    /// @param amountOut Net output credited to the order (after the execution fee)
+    /// @param executionPrice The saturating 1e18-scaled fill price (pre-internal-swap spot)
     event OrderFilled(
         uint256 indexed orderId, address indexed creator, uint96 amountIn, uint96 amountOut, uint128 executionPrice
     );
@@ -279,16 +294,26 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @param reason Human-readable failure reason
     event OrderExecutionFailed(uint256 indexed orderId, string reason);
 
-    /// @notice Emitted when admin force-cancels an orphaned order
+    /// @notice Emitted when admin force-cancels an orphaned (unfilled) order
+    /// @param orderId The force-cancelled order
+    /// @param admin The owner who triggered the force-cancel (refund goes to the order's NFT owner)
     event OrderForceCancelled(uint256 indexed orderId, address indexed admin);
 
-    /// @notice Emitted when fee rate is updated
+    /// @notice Emitted when the execution fee rate is updated
+    /// @param oldFeeBps The previous fee in basis points
+    /// @param newFeeBps The new fee in basis points (<= MAX_FEE_BPS)
     event FeeBpsUpdated(uint256 oldFeeBps, uint256 newFeeBps);
 
-    /// @notice Emitted when fees are withdrawn
+    /// @notice Emitted when accumulated fees are withdrawn by the owner
+    /// @param currency The currency withdrawn
+    /// @param recipient The address that received the fees
+    /// @param amount The amount withdrawn (the full pendingFees balance for `currency`)
     event FeesWithdrawn(Currency indexed currency, address indexed recipient, uint256 amount);
 
-    /// @notice Emitted when a fee is collected from an order execution
+    /// @notice Emitted when an execution fee is collected from a fill into pendingFees
+    /// @param orderId The order whose fill produced the fee
+    /// @param currency The currency the fee was taken in (the order's output currency)
+    /// @param feeAmount The fee amount credited to pendingFees
     event FeeCollected(uint256 indexed orderId, Currency indexed currency, uint256 feeAmount);
 
     /// @notice Emitted when an ERC-4626 vault redeem reverts during claimOrder.
@@ -320,6 +345,8 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
 
     /// @notice Declare which hook callbacks this contract implements
     /// @dev UHI9: added afterAddLiquidity + afterAddLiquidityReturnDelta for IL tracking
+    /// @return The Hooks.Permissions enabling afterInitialize, afterAddLiquidity(+ReturnDelta),
+    ///         beforeSwap(+ReturnDelta), and afterSwap(+ReturnDelta)
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: false,
@@ -533,42 +560,66 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                           VIEW FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Get full order data by ID
+    /// @notice Get full order data by ID.
+    /// @param orderId The order to look up
+    /// @return The full LimitOrder struct (amounts, tokens, triggerPrice, isFilled, zeroForOne,
+    ///         vaultShares, sqrtPriceAtFill, poolId). Fields persist after burn — check ownerOf for liveness.
     function getOrder(uint256 orderId) external view returns (LimitOrder memory) {
         return orders[orderId];
     }
 
-    /// @notice Get all order IDs for a given user
+    /// @notice Get all order IDs ever created by a user (append-only; may include filled/cancelled ids).
+    /// @param user The address whose order IDs to return
+    /// @return An append-only list of the user's orderIds — read-only, intended for off-chain paging
     function getUserOrders(address user) external view returns (uint256[] memory) {
         return userOrders[user];
     }
 
-    /// @notice Get all order IDs in a specific (pool, tick) bucket
+    /// @notice Get all order IDs currently indexed in a specific (pool, tick) bucket.
+    /// @param poolId The pool whose bucket to read
+    /// @param tick The aligned tick bucket
+    /// @return The live orderIds in (poolId, tick)
     function getOrdersInTick(PoolId poolId, int24 tick) external view returns (uint256[] memory) {
         return tickToOrders[poolId][tick];
     }
 
-    /// @notice Get the tick bucket an order was assigned to
+    /// @notice Get the aligned tick bucket an order was assigned to at creation.
+    /// @param orderId The order to look up
+    /// @return The aligned tick bucket
     function getTickBucket(uint256 orderId) external view returns (int24) {
         return orderTickBucket[orderId];
     }
 
-    /// @notice Get the next active tick above the given tick (per pool)
+    /// @notice Get the next active tick above the given tick (per pool).
+    /// @param poolId The pool whose active-tick list to read
+    /// @param tick The tick to step up from
+    /// @return The next higher active tick, or SENTINEL_MAX if none
     function getNextActiveTick(PoolId poolId, int24 tick) external view returns (int24) {
         return nextActiveTick[poolId][tick];
     }
 
-    /// @notice Get the next active tick below the given tick (per pool)
+    /// @notice Get the next active tick below the given tick (per pool).
+    /// @param poolId The pool whose active-tick list to read
+    /// @param tick The tick to step down from
+    /// @return The next lower active tick, or SENTINEL_MIN if none
     function getPrevActiveTick(PoolId poolId, int24 tick) external view returns (int24) {
         return prevActiveTick[poolId][tick];
     }
 
-    /// @notice Get accumulated fees for a specific currency
+    /// @notice Get accumulated, withdrawable fees for a specific currency.
+    /// @param currency The currency to query
+    /// @return The accumulated pendingFees for `currency`
     function getPendingFees(Currency currency) external view returns (uint256) {
         return pendingFees[currency];
     }
 
-    /// @notice Get LP position data for a specific pool and LP address
+    /// @notice Get LP position data for a specific pool and LP address.
+    /// @dev INFORMATIONAL TELEMETRY ONLY. `lpPositions` is populated from spoofable
+    ///      `afterAddLiquidity` hookData (finding J1) and is NEVER used for payouts, rebate sizing,
+    ///      eligibility, or access control. Do not rely on it for accounting.
+    /// @param poolId The pool to query
+    /// @param lp The LP address to query
+    /// @return The recorded (spoofable) LPPosition telemetry
     function getLPPosition(PoolId poolId, address lp) external view returns (LPPosition memory) {
         return lpPositions[poolId][lp];
     }
@@ -930,7 +981,14 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                         PRICE HELPERS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Convert sqrtPriceX96 (Uniswap format) to uint128 price scaled to 1e18
+    /// @notice Convert sqrtPriceX96 (Uniswap Q64.96 format) to a uint128 price scaled to 1e18.
+    /// @dev Reverting accounting/eligibility helper: the `sqrtPrice * sqrtPrice` step panics (0x11)
+    ///      for a pool priced above ~1.85e19, and `.toUint128()` reverts above uint128 max. Such
+    ///      prices are only reachable on an extreme, self-attacked pool (H1/H2 isolate real pools).
+    ///      Event fields use the saturating `_executionPrice` helper instead, so the fill path does
+    ///      not inherit this revert.
+    /// @param sqrtPriceX96 The Uniswap Q64.96 sqrt price
+    /// @return price The price scaled to 1e18 (token1 per token0)
     function sqrtPriceToUint128(uint160 sqrtPriceX96) public pure returns (uint128 price) {
         uint256 sqrtPrice = uint256(sqrtPriceX96);
         uint256 priceX96 = (sqrtPrice * sqrtPrice) / (1 << 96);
@@ -938,7 +996,12 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         price = priceScaled.toUint128();
     }
 
-    /// @notice Convert uint128 price (1e18 scaled) to sqrtPriceX96
+    /// @notice Convert a uint128 price (1e18 scaled) to sqrtPriceX96.
+    /// @dev Panics (0x11) at the `priceX192 * 2^96` step for price > ~1.845e37. Only reached from
+    ///      createLimitOrder, which bounds `triggerPrice <= MAX_TRIGGER_PRICE (1e36)` so every
+    ///      creatable order stays well inside the safe range (finding L1).
+    /// @param price The 1e18-scaled price to convert
+    /// @return sqrtPriceX96 The Uniswap Q64.96 sqrt price
     function uint128ToSqrtPrice(uint128 price) public pure returns (uint160 sqrtPriceX96) {
         uint256 priceX192 = (uint256(price) * (1 << 96)) / 1e18;
         uint256 priceX96Full = priceX192 * (1 << 96);
@@ -946,7 +1009,9 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         sqrtPriceX96 = sqrtPriceRaw.toUint160();
     }
 
-    /// @notice Integer square root (Babylonian method)
+    /// @notice Integer square root (Babylonian method).
+    /// @param x The value to take the integer square root of
+    /// @return y floor(sqrt(x))
     function sqrt(uint256 x) public pure returns (uint256 y) {
         if (x == 0) return 0;
         uint256 z = (x + 1) / 2;

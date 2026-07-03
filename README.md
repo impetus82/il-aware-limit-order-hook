@@ -93,24 +93,33 @@ All token flows use Uniswap V4's native flash accounting (`sync -> transfer -> s
 - Atomic settlement within the PoolManager's unlock context
 - Compatibility with V4's transient storage model (Cancun EVM)
 
-### 3. Anti-DoS Graceful Execution
+### 3. Anti-DoS Graceful Execution + Hard Price Gate
 
-`_executeOrder` returns `bool success` instead of reverting on slippage:
+`_executeOrder` returns `bool success` instead of reverting — a single toxic order can never revert a
+third party's triggering swap:
 
 ```solidity
-// Failed orders emit an event and stay in the bucket for next swap
+// A skipped order emits an event and stays resting; the swap still completes.
 if (!success) {
-    emit OrderExecutionFailed(orderId, "slippage");
-    continue; // don't revert the whole swap
+    emit OrderExecutionFailed(orderId, "PriceGate");
+    i++; // don't revert the whole swap; try again next swap
 }
 ```
 
-A single toxic order (extreme slippage) cannot block ALL swaps in the pool. This eliminates the critical DoS vector present in naive limit-order hook designs.
+Fills are protected by a **hard price gate** (fix M4): the internal fill swap's `sqrtPriceLimitX96` is
+anchored to the order's own `triggerPrice ± MAX_SLIPPAGE_BPS` (0.5%) via the non-reverting
+`_tolerantSqrtLimit`, so the swap is *physically unable* to execute worse than the user's price — it is
+not a post-hoc "fill anyway and warn" check. An order that cannot fill within tolerance skips cleanly
+(a provably zero-delta no-op); an order larger than the tolerance-band depth fills **partially at
+trigger-or-better** and refunds the unused input (the order then closes; the remainder is not re-queued).
 
 Gas metering prevents out-of-gas reverts when many orders queue up:
 ```solidity
 if (gasleft() < GAS_LIMIT_PER_ORDER) break; // resume next swap
 ```
+
+Together these eliminate the DoS vector present in naive limit-order hook designs *and* the "limit order
+fills below your price" flaw of an advisory slippage check.
 
 ### 4. Oracle-Free IL Calculation
 
@@ -145,14 +154,27 @@ This hook addresses that loss with a two-sided mitigation:
 |-------|-------------------|----------------|
 | Order creator | Receives output tokens, no yield while waiting | Output earns yield in ERC-4626 vault |
 | Order creator after fill | Receives exactly `amountOut`, no IL recovery | Receives `amountOut + min(yield, IL)` |
-| LP providing liquidity | Earns fees, suffers full IL from limit executions | IL data available via `lpPositions` for external rebate programs |
+| LP providing liquidity | Earns fees, suffers full IL from limit executions | Unchanged — the hook takes no LP funds (`lpPositions` is spoofable off-chain telemetry, **not** a trusted feed; see below) |
 
 The rebate formula `rebate = min(yield, ilAmount)` ensures:
 - The creator can never receive **more** than their actual IL (no windfall)
 - If `yield >= IL`: creator is fully compensated, keeps any excess yield
 - If `yield < IL`: creator keeps all yield and absorbs only the residual IL — net-positive versus an idle order whenever yield exceeds the small execution fee
 
-**Solvency is preserved by construction.** The rebate is capped at `min(yield, ilAmount)`, so the hook never pays out more than the yield it actually earned on tokens already owed to that user, and every order is isolated by `orderId` (no shared pot to drain). If the vault ever reverts on redeem, `claimOrder` degrades gracefully: it draws nothing from other orders' custody, leaves the position fully intact (NFT + vault shares), and lets the owner re-claim once the vault recovers — so a vault failure can neither make the hook insolvent nor trap a user's funds.
+**Solvency is preserved by construction.** The rebate is capped at `min(yield, ilAmount)` *and*, in the
+vault path, hard-capped at the amount the vault actually redeemed in the same transaction (the M2
+`RebateExceedsRedeemed` guard) — so the payout is self-funded by construction, and a future change to the
+IL formula can never silently draw from other orders' custody or from fees. Every order is isolated by
+`orderId` (no shared pot to drain). If the vault ever reverts on redeem, `claimOrder` degrades
+gracefully: it draws nothing from other orders' custody, leaves the position fully intact (NFT + vault
+shares), emits `VaultRedeemFailed`, and lets the owner re-claim once the vault recovers — so a vault
+failure can neither make the hook insolvent nor trap a user's funds. These properties are checked under
+random sequences by the Phase-2 [invariant suite](#security--audit).
+
+> **`lpPositions` is spoofable telemetry, not a trusted feed (finding J1).** `afterAddLiquidity` records
+> an `LPPosition` from caller-supplied `hookData`, so any caller can forge any LP's entry. It is
+> **informational only** — no payout, rebate, eligibility, or access-control path reads it. Do not rely
+> on it for accounting or rebate programs.
 
 ---
 
@@ -163,36 +185,94 @@ All 7 flags are enabled:
 | Flag | Bit | Purpose |
 |------|-----|---------|
 | `afterInitialize` | 12 | Record `lastTick` and `sqrtPriceBaseline` at pool creation |
-| `afterAddLiquidity` | 10 | Decode `hookData` to track real LP identity for IL |
+| `afterAddLiquidity` | 10 | Record spoofable off-chain LP telemetry from `hookData` (**not** used for IL math or payouts — see J1) |
 | `beforeSwap` | 7 | Passthrough (required for `beforeSwapReturnDelta`) |
 | `afterSwap` | 6 | Execute eligible orders, update `lastTick` |
-| `beforeSwapReturnDelta` | 3 | Future: dynamic fee hook pathway |
+| `beforeSwapReturnDelta` | 3 | Reserved for a future dynamic-fee pathway |
 | `afterSwapReturnDelta` | 2 | Enable precise output accounting |
-| `afterAddLiquidityReturnDelta` | 1 | Enable LP position recording |
+| `afterAddLiquidityReturnDelta` | 1 | Reserved — currently returns a zero delta (no-op) |
 
 ---
 
 ## Contract Interface
 
 ```solidity
-// Place a limit order -- mints ERC-721 NFT to msg.sender
+// Place a limit order -- mints ERC-721 NFT to msg.sender.
+// NOTE the parameter order: (poolKey, zeroForOne, amountIn, triggerPrice).
 function createLimitOrder(
     PoolKey calldata poolKey,
-    uint128 triggerPrice,
-    bool zeroForOne,
-    uint96 inputAmount
+    bool zeroForOne,      // sell token0 (true) or buy token0 (false)
+    uint96 amountIn,      // input amount escrowed
+    uint128 triggerPrice  // 1e18-scaled; must be in (0, MAX_TRIGGER_PRICE = 1e36]
 ) external returns (uint256 orderId);
 
-// Cancel active order -- burns NFT, refunds input tokens
+// Cancel active order -- burns NFT, refunds input tokens (owner only)
 function cancelOrder(uint256 orderId) external;
 
-// After order fills: deposit output to ERC-4626 vault to earn yield
+// After order fills: deposit output to the ERC-4626 vault to earn yield (owner only).
+// Only works if the order's OUTPUT token is the vault asset; otherwise it no-ops gracefully.
 function depositToVault(uint256 orderId) external;
 
-// Claim filled order output + optional IL rebate from yield
-// Burns the ERC-721 NFT
+// Claim filled order output + optional IL rebate from yield; burns the NFT (owner only).
+// The full PoolKey is REQUIRED and validated (reverts PoolKeyMismatch on a foreign key).
 function claimOrder(uint256 orderId, PoolKey calldata poolKey) external;
+
+// Admin (Ownable): execution-fee controls and stuck-order cleanup.
+function setFeeBps(uint256 newFeeBps) external;              // <= MAX_FEE_BPS = 50 (0.5%)
+function withdrawFees(Currency currency, address recipient) external; // pendingFees only
+function forceCancelOrder(uint256 orderId) external;         // UNFILLED orders only
 ```
+
+> **Execution fee.** Each fill skims `feeBps` (default **5 BPS = 0.05%**, admin-settable up to 0.5%)
+> from the output into `pendingFees`, withdrawable by the owner via `withdrawFees`. Fees are held in a
+> balance structurally separate from order custody (see [Security](#security--audit)).
+
+---
+
+## Security & Audit
+
+This contract has been hardened for an external audit. Two auditor-facing documents accompany it:
+
+- **[docs/AUDIT_SCOPE.md](docs/AUDIT_SCOPE.md)** — contracts in/out of scope, actors & trust model
+  (exact admin powers and limits), external dependencies, assets at risk, and accepted risks.
+- **[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)** — attack surface per entry point, the core security
+  properties and why they hold, and a table of concrete attack scenarios with mitigations.
+
+### Findings addressed
+
+Every finding from the hackathon judge feedback and an independent audit-prep scan is fixed on branch
+`fix/pool-isolation-h1-h2` (one commit per finding):
+
+| # | Sev | Finding | Resolution |
+|---|-----|---------|------------|
+| **H1** | HIGH | `claimOrder` accepted a caller-chosen `PoolKey` (no order→pool binding) | Order stores `poolId`; `claimOrder` reverts `PoolKeyMismatch` on a foreign key |
+| **H2** | HIGH | Tick buckets / active-tick list not namespaced by `PoolId` → cross-pool collision | All order indexing namespaced by `PoolId`; per-pool sentinels; unsound `token0` filter removed |
+| **H3** | HIGH | `forceCancelOrder` could strand `vaultShares` | Proven unreachable (`vaultShares>0 ⟹ isFilled`); documented invariant + test |
+| **M1** | MED | IL used output amount as a dimensionally-wrong "liquidity" | Renamed `outputNotional` + honest NatSpec; safety is the yield cap, not precision |
+| **M2** | MED | `pendingFees` + order outputs shared one balance | Structural guard: vault-path payout reverts `RebateExceedsRedeemed` if it exceeds redeemed; solvency tests |
+| **M3** | MED | Unbounded per-tick arrays → O(n) cancel/forceCancel griefing DoS | O(1) swap-and-pop via `orderBucketIndex` |
+| **M4** | MED | Fixed ±5% advisory slippage → orders could fill worse than trigger | Hard price gate anchored to `triggerPrice` (± 0.5%); skip-and-rest; forced-fill blocks deleted |
+| **J2** | LOW | IL uses spot price, no TWAP | Accepted — `min(yield, IL)` + `redeemed` caps bound it to the user's own yield; documented |
+| **L1** | LOW | Extreme `triggerPrice` could panic / defeat the M4 gate | `MAX_TRIGGER_PRICE = 1e36` bound (clean revert before any state change) |
+
+**J1** (spoofable `lpPositions` telemetry) is a **documented accepted risk** — it is never read for
+payouts or access control (see the note in [Who Bears the IL Risk?](#who-bears-the-il-risk)).
+
+### Invariants (Phase-2 Foundry suite)
+
+`test/ILAwareLimitOrderHookInvariant.t.sol` drives random sequences over **two pools sharing
+`currency0`** (the H1/H2 collision shape), in a no-vault and a yielding-vault configuration, asserting
+after every action:
+
+1. **Solvency** — `balanceOf(hook) >= custody(unfilled) + output(filled-unclaimed) + pendingFees`
+   per currency (vault-deposited output excluded; `>=` because un-rebated yield is a safe surplus).
+2. **Pool isolation & bucket hygiene** — every bucket entry belongs to its pool, is live + unfilled,
+   and unique.
+3. **Vault-share consistency** — `Σ order.vaultShares == vault.sharesOf(hook)`.
+
+The suite also drives a vault that can **revert** or **haircut** redeems and orders large enough to
+force **partial fills** — the invariants hold under all of these, and each was mutation-tested (shown to
+fail on an injected bug), so the suite has teeth.
 
 ---
 
@@ -246,7 +326,7 @@ Pool init tx: [0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a
 ## Testing
 
 ```bash
-# Run all 53 tests
+# Run all 71 tests
 forge test -vvv
 
 # Unit tests (pure functions, no deployment)
@@ -255,20 +335,26 @@ forge test --match-contract ILAwareLimitOrderHookTest -vvv
 # Integration tests (full PoolManager + hook lifecycle)
 forge test --match-contract ILAwareLimitOrderHookIntegrationTest -vvv
 
+# Phase-2 invariant suite (solvency / pool-isolation / vault-share consistency)
+forge test --match-path test/ILAwareLimitOrderHookInvariant.t.sol -vvv
+
 # Gas report
 forge test --gas-report
 ```
 
-**Test coverage:** 53 tests — 53 passing, 0 failing
+**Test coverage:** 71 tests — 71 passing, 0 failing (64 unit/integration + 7 Phase-2 invariants).
 
 Key scenarios covered:
 - `test_AfterInitialize` — baseline price recorded at pool creation
 - `test_ILCalculation_PriceDoubled` — IL approximation accuracy
 - `test_YieldRebate_OnClaim` — end-to-end vault yield rebate flow
 - `test_ERC721_Claim_After_Transfer` — secondary market: new NFT owner claims filled order
-- `testGracefulExecutionOnSlippage` — anti-DoS: failed orders do not block the pool
+- `testGracefulExecutionOnSlippage` — anti-DoS: a failed order does not block the pool
 - `test_GracefulClaim_VaultReverts_JuneFix` — vault redeem failure never traps funds; position preserved and re-claimable
-- `testBatchExecution` — multiple orders executed in a single swap
+- `test_H2_CrossPoolIsolation` — an order in pool A is never filled by a swap in a different pool sharing `currency0`
+- `test_M4_HardGate_PartialFillProtectsPrice` — a large order fills partially at trigger-or-better and refunds the rest
+- `test_L1_RejectsExcessiveTriggerPrice` — an out-of-range trigger price reverts cleanly instead of panicking
+- `invariant_solvency` / `invariant_poolIsolationAndBucketHygiene` / `invariant_vaultSharesConsistent` — Phase-2 invariants over two pools sharing `currency0`, with a vault that can revert/haircut redeems and force partial fills
 
 ---
 
@@ -285,8 +371,12 @@ Key scenarios covered:
 |   |-- TriggerSwapUnichain.s.sol
 |   +-- RecoverPool.s.sol
 |-- test/
-|   |-- ILAwareLimitOrderHook.t.sol             # Unit tests
-|   +-- ILAwareLimitOrderHookIntegration.t.sol  # Integration tests (45 tests)
+|   |-- ILAwareLimitOrderHook.t.sol              # Unit tests (5 tests)
+|   |-- ILAwareLimitOrderHookIntegration.t.sol   # Integration tests (59 tests)
+|   +-- ILAwareLimitOrderHookInvariant.t.sol     # Phase-2 Foundry invariants (solvency / isolation / vault shares)
+|-- docs/
+|   |-- AUDIT_SCOPE.md                           # Audit scope, actors, assets at risk, accepted risks
+|   +-- THREAT_MODEL.md                          # Attack surface, security properties, attack scenarios
 +-- frontend/                                    # Next.js 16 + wagmi v2
     +-- src/
         |-- components/
