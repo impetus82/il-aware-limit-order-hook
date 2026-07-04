@@ -141,15 +141,18 @@ contract ILAwareLimitOrderHookAaveForkTest is Test {
         assertGt(assetsAfterWarp, assetsAtDeposit, "REAL Aave yield must accrue over time");
 
         // ── Claim: redeem from real Aave + pay output (+ self-funded rebate) ──
+        Currency usdc = Currency.wrap(USDC);
         uint256 aliceBefore = IERC20(USDC).balanceOf(alice);
         uint256 hookBeforeClaim = IERC20(USDC).balanceOf(address(hook));
+        uint256 feesBeforeClaim = hook.getPendingFees(usdc);
         vm.prank(alice);
         hook.claimOrder(orderId, poolKey);
         uint256 received = IERC20(USDC).balanceOf(alice) - aliceBefore;
         uint256 hookGain = IERC20(USDC).balanceOf(address(hook)) - hookBeforeClaim; // un-rebated yield kept
+        uint256 feesFromClaim = hook.getPendingFees(usdc) - feesBeforeClaim; // surplus credited to pendingFees
 
         console2.log("alice received on claim:", received);
-        console2.log("un-rebated yield kept by hook:", hookGain);
+        console2.log("un-rebated yield captured to pendingFees:", feesFromClaim);
 
         // The position is closed (NFT burned) -> the real-Aave redeem succeeded (no VaultRedeemFailed).
         vm.expectRevert();
@@ -161,11 +164,16 @@ contract ILAwareLimitOrderHookAaveForkTest is Test {
         assertGt(received + hookGain, outputAmount, "REAL Aave yield was actually captured on redeem");
         assertGe(received, outputAmount, "self-funded payout: alice gets at least her principal");
 
-        // NOTE (roadmap, HIGH): `hookGain` is un-rebated yield (yield beyond the min(yield, IL) rebate).
-        // It is solvency-safe surplus, but it currently has NO withdrawal path (it is not pendingFees).
-        // With a REAL yield vault this is real stranded USDC — credit it to pendingFees or add an owner
-        // sweep before mainnet. This assertion makes the leak visible rather than hidden.
-        assertGt(hookGain, 0, "un-rebated yield is retained by the hook with no withdrawal path (roadmap)");
+        // Stranded-yield fix (HIGH, closed): the un-rebated yield left in the hook is now credited to
+        // pendingFees exactly (it is no longer untracked surplus), and the owner can withdraw it.
+        assertGt(feesFromClaim, 0, "REAL Aave un-rebated yield must be captured to pendingFees");
+        assertEq(feesFromClaim, hookGain, "pendingFees credit must equal the retained USDC (no leak)");
+
+        address feeSink = makeAddr("feeSink");
+        uint256 pendingNow = hook.getPendingFees(usdc);
+        hook.withdrawFees(usdc, feeSink); // caller is owner (address(this))
+        assertEq(IERC20(USDC).balanceOf(feeSink), pendingNow, "owner withdraws the full pendingFees incl. yield");
+        assertEq(hook.getPendingFees(usdc), 0, "pendingFees zeroed after withdrawal");
     }
 
     /// @notice Same lifecycle but a claim BEFORE any warp: redeem returns ~principal, no revert, order closes.

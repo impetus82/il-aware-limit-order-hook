@@ -66,7 +66,7 @@ Owner-only; requires `isFilled`. Force-approves the output token to the vault an
 
 ### 2.6 Admin functions — `setFeeBps`, `withdrawFees`, `forceCancelOrder` (`onlyOwner`)
 - `setFeeBps`: bounded by `MAX_FEE_BPS = 50` BPS.
-- `withdrawFees`: transfers only `pendingFees[currency]`, which is credited *solely* after the matching `take` in `_executeOrder`; structurally cannot touch order custody (§3.1, M2).
+- `withdrawFees`: transfers only `pendingFees[currency]` — the per-fill execution fees plus the un-rebated vault yield captured on claim — each credited *solely* after the matching physical `take`/`redeem`; structurally cannot touch order custody (§3.1, M2).
 - `forceCancelOrder`: only **unfilled** orders (`isFilled` guard + `_ownerOf != 0`), returns input to the current NFT owner, burns. Cannot reach a vault-backed position because `vaultShares > 0 ⟹ isFilled` (H3 monotonic invariant), so no principal can be stranded and the admin cannot seize a filled position.
 
 ### 2.7 `afterAddLiquidity` — no-op (J1 removed)
@@ -79,12 +79,12 @@ Owner-only; requires `isFilled`. Force-approves the output token to the vault an
 Each property is tied to the concrete mechanism that enforces it and the finding/invariant that covers it.
 
 ### 3.1 Solvency — the hook always holds at least what it owes, per currency
-**Property.** For every currency, `balanceOf(hook) >= Σ(unfilled-order input custody) + Σ(filled-unclaimed output) + pendingFees`, with vault-deposited outputs excluded (the vault backs them). `>=` rather than `==` because un-rebated vault yield accretes as a safe surplus.
+**Property.** For every currency, `balanceOf(hook) >= Σ(unfilled-order input custody) + Σ(filled-unclaimed output) + pendingFees`, with vault-deposited outputs excluded (the vault backs them). `pendingFees` now includes the un-rebated vault yield (captured on claim, no longer stranded); `>=` rather than `==` remains only because ERC-4626 share-redemption rounding can leave sub-wei dust as a safe surplus.
 
 **Why it holds — three separated pots, no shared draw:**
 1. **Input custody** is taken in `createLimitOrder` and only ever returned to the owner (cancel/forceCancel) or consumed by the fill swap (`settle` of the *actual* delta).
 2. **Filled output** is `take`n into the hook in `_executeOrder` and recorded in `order.amount0/amount1`; it leaves only via `claimOrder` to the owner.
-3. **Fees** are `take`n *separately* and credited to `pendingFees[currency]` **only after** the physical take; `withdrawFees` touches nothing but `pendingFees`. This is why fee withdrawal cannot eat principal (M2, `test_M2_WithdrawFees_CannotEatOrderPrincipal`).
+3. **Fees** are `take`n *separately* and credited to `pendingFees[currency]` **only after** the physical take; the un-rebated vault yield is likewise credited to `pendingFees` **only after** the vault `redeem` has physically delivered it (`surplus = redeemed - totalOut`, so the credit is fully backed). `withdrawFees` touches nothing but `pendingFees`. This is why fee withdrawal cannot eat principal (M2, `test_M2_WithdrawFees_CannotEatOrderPrincipal`).
 
 **Rebate is structurally self-funded.** In the vault claim path the payout is funded *only* by what the vault delivered this transaction; `if (totalOut > redeemed) revert RebateExceedsRedeemed()` (M2) makes "the rebate never draws from other orders or from fees" hold **by construction**, not by arithmetic coincidence of the IL formula. A future change to the IL heuristic cannot silently break solvency. The rebate is additionally capped at `min(yieldEarned, ilAmount)`, so it never exceeds the user's own realized yield.
 

@@ -245,7 +245,10 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice Current execution fee in basis points (default: 5 = 0.05%)
     uint256 public feeBps = 5;
 
-    /// @notice Accumulated fees per currency, withdrawable by owner
+    /// @notice Accumulated protocol revenue per currency, withdrawable by the owner. Holds both the
+    ///         per-fill execution fees and the un-rebated vault yield credited on claim (yield beyond
+    ///         the min(yield, IL) rebate). Every credit happens ONLY after the matching take/redeem,
+    ///         so this balance is always fully backed by the hook and never draws on order custody.
     mapping(Currency => uint256) public pendingFees;
 
     /*//////////////////////////////////////////////////////////////
@@ -303,6 +306,13 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @param currency The currency the fee was taken in (the order's output currency)
     /// @param feeAmount The fee amount credited to pendingFees
     event FeeCollected(uint256 indexed orderId, Currency indexed currency, uint256 feeAmount);
+
+    /// @notice Emitted when un-rebated vault yield (beyond the min(yield, IL) rebate) is credited to
+    ///         pendingFees as protocol revenue on claim.
+    /// @param orderId The claimed order whose vault redeem produced the surplus
+    /// @param currency The output currency the surplus is denominated in
+    /// @param amount The surplus amount credited to pendingFees
+    event YieldSurplusToFees(uint256 indexed orderId, Currency indexed currency, uint256 amount);
 
     /// @notice Emitted when an ERC-4626 vault redeem reverts during claimOrder.
     /// @dev    The order is left FULLY intact (NFT, amounts, and vaultShares preserved) so the
@@ -1215,6 +1225,17 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                 // coincidence of the rebate formula) — a future formula change cannot silently
                 // draw from other orders' custody or from pendingFees.
                 if (totalOut > redeemed) revert RebateExceedsRedeemed();
+
+                // Un-rebated yield (whatever the vault delivered beyond output + the min(yield, IL)
+                // rebate) is protocol revenue: credit it to pendingFees so the owner can withdraw it,
+                // instead of leaving it as untracked, un-withdrawable surplus in the hook. Solvency-safe
+                // by construction: 0 <= surplus = redeemed - totalOut, fully backed by what the vault
+                // just delivered this tx, and it is accounted for by the per-currency solvency invariant.
+                uint256 surplus = redeemed - totalOut;
+                if (surplus > 0) {
+                    pendingFees[Currency.wrap(outputToken)] += surplus;
+                    emit YieldSurplusToFees(orderId, Currency.wrap(outputToken), surplus);
+                }
             } catch {
                 // Vault redeem reverted: the principal is still locked in the vault, NOT in this
                 // hook. Paying `outputAmount` now would have to come from other orders' custodied

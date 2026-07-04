@@ -1544,6 +1544,100 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         console2.log("Alice received on claim:", aliceAfter - aliceBefore);
     }
 
+    /// @notice Stranded-yield fix: vault yield beyond the min(yield, IL) rebate must be captured as
+    ///         protocol revenue in pendingFees (and be withdrawable), not left stranded in the hook.
+    /// @dev    Uses a high vault yield (50%) so redeemed >> output + IL rebate, guaranteeing a non-zero
+    ///         surplus. Asserts: (1) claiming credits the surplus to pendingFees[output], (2) the owner
+    ///         can withdraw that pendingFees balance in full, and (3) the surplus is real (> 0). Closes
+    ///         the HIGH finding where un-rebated yield was un-withdrawable dust accreting in the hook.
+    function test_M2Fix_UnrebatedYield_CreditedToPendingFees_AndWithdrawable() public {
+        MockERC4626 vault = new MockERC4626(address(token0));
+        vault.setYieldBps(5000); // 50% yield → far exceeds any IL rebate on this fill
+
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory args = abi.encode(address(manager), address(this), address(vault));
+        vm.pauseGasMetering();
+        (address predicted, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
+        ILAwareLimitOrderHook hookWithVault =
+            new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
+        require(address(hookWithVault) == predicted, "mismatch");
+        vm.resumeGasMetering();
+
+        PoolKey memory vaultPoolKey = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 100,
+            tickSpacing: 1,
+            hooks: hookWithVault
+        });
+        manager.initialize(vaultPoolKey, TickMath.getSqrtPriceAtTick(0));
+
+        token0.mint(address(this), 5_000e18);
+        token1.mint(address(this), 5_000e18);
+        modifyLiquidityRouter.modifyLiquidity(
+            vaultPoolKey,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)
+            }),
+            ""
+        );
+
+        token1.mint(alice, 10e18);
+        vm.startPrank(alice);
+        token1.approve(address(hookWithVault), type(uint256).max);
+        token0.approve(address(hookWithVault), type(uint256).max);
+        uint256 orderId = hookWithVault.createLimitOrder(vaultPoolKey, false, 1e18, 1.002e18);
+        vm.stopPrank();
+
+        // Fill the order.
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            vaultPoolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        vm.prank(alice);
+        hookWithVault.depositToVault(orderId);
+        assertTrue(hookWithVault.getOrder(orderId).vaultShares > 0, "Shares should be deposited");
+
+        Currency out = Currency.wrap(address(token0));
+
+        // Snapshot pendingFees immediately before claim: the delta isolates the yield surplus credit.
+        uint256 feesBeforeClaim = hookWithVault.getPendingFees(out);
+
+        vm.prank(alice);
+        hookWithVault.claimOrder(orderId, vaultPoolKey);
+
+        uint256 feesAfterClaim = hookWithVault.getPendingFees(out);
+        uint256 surplus = feesAfterClaim - feesBeforeClaim;
+
+        // (1) + (3): the un-rebated yield was captured into pendingFees, and it is a real, positive amount.
+        assertGt(surplus, 0, "un-rebated vault yield must be credited to pendingFees, not stranded");
+
+        // (2): the owner can withdraw the full accrued pendingFees balance.
+        address feeSink = makeAddr("feeSink");
+        uint256 sinkBefore = token0.balanceOf(feeSink);
+        hookWithVault.withdrawFees(out, feeSink); // caller is owner (address(this))
+
+        assertEq(
+            token0.balanceOf(feeSink) - sinkBefore,
+            feesAfterClaim,
+            "owner must withdraw exactly the accrued pendingFees (incl. yield surplus)"
+        );
+        assertEq(hookWithVault.getPendingFees(out), 0, "pendingFees must be zeroed after withdrawal");
+        console2.log("Yield surplus captured to pendingFees:", surplus);
+    }
+
     /// @notice June fix: a vault revert during claimOrder must not trap the user's funds.
     /// @dev    Proves the solvency-safe graceful fallback: when a deposited order's vault redeem
     ///         reverts, (1) claimOrder does NOT revert, (2) it emits VaultRedeemFailed, (3) it pays

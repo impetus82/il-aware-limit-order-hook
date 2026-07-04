@@ -95,7 +95,7 @@ The admin's powers are **deliberately narrow**. Enumerated exactly:
 | Function | Exact power | Bound |
 |----------|-------------|-------|
 | `setFeeBps(uint256)` | Set the per-fill execution fee | **Cannot exceed `MAX_FEE_BPS = 50` (0.5%)** — reverts `FeeTooHigh`. Applies to future fills only. |
-| `withdrawFees(Currency, address)` | Withdraw accrued fees | **Can withdraw `pendingFees[currency]` only.** This balance is credited *only* after the matching fee was physically `take`-n into the hook (see M2). It is structurally disjoint from order custody and vault deposits. |
+| `withdrawFees(Currency, address)` | Withdraw accrued protocol revenue | **Can withdraw `pendingFees[currency]` only.** This balance holds the per-fill execution fees *and* the un-rebated vault yield captured on claim (yield beyond the `min(yield, IL)` rebate). Every credit happens *only* after the matching physical `take`/`redeem` into the hook (see M2), so it is structurally disjoint from order custody and vault deposits. |
 | `forceCancelOrder(uint256)` | Refund + burn a stuck order | **UNFILLED orders only** — reverts `OrderAlreadyFilled` on a filled order, `OrderNotActive` on an already-burned one. Tokens go to the **current NFT owner**, not the admin. |
 
 **What the admin CANNOT do:**
@@ -147,7 +147,7 @@ auditors should note the usual "owner key compromise" surface is limited to the 
 | **Order input (custody)** | Hook balance, tracked in `order.amount0`/`amount1` of unfilled orders | `cancelOrder` / `forceCancelOrder` (refund to owner) or consumed by the fill swap |
 | **Filled output** | Hook balance (unless deposited to vault) | `claimOrder` (to NFT owner), optionally + IL rebate |
 | **Vault-deposited output** | ERC-4626 vault as shares (`order.vaultShares`) | `claimOrder` redeems shares back into the hook, then pays out |
-| **`pendingFees`** | Hook balance, per-currency | `withdrawFees` (owner only) |
+| **`pendingFees`** | Hook balance, per-currency (execution fees + un-rebated vault yield) | `withdrawFees` (owner only) |
 | **Vault shares** | Held by the hook in the vault; each share backed by exactly one live order | tracked by `order.vaultShares`; §7 invariant |
 
 ---
@@ -161,8 +161,9 @@ configuration.
 
 1. **Solvency** (`invariant_solvency`): for every currency,
    `balanceOf(hook) >= custody(unfilled orders) + output(filled-unclaimed orders) + pendingFees`.
-   Vault-deposited outputs are excluded (backed by the vault, not the hook balance). `>=` rather than
-   `==` because un-rebated yield accretes as a safe surplus.
+   Vault-deposited outputs are excluded (backed by the vault, not the hook balance). `pendingFees` now
+   captures the un-rebated vault yield on claim (previously left as untracked surplus); `>=` rather than
+   `==` remains because ERC-4626 share-redemption rounding can leave sub-wei dust as a safe surplus.
 2. **Pool isolation & bucket hygiene** (`invariant_poolIsolationAndBucketHygiene`): every entry in a
    `(poolId, tick)` bucket belongs to that pool (H1/H2), is live (NFT not burned) and unfilled, and
    appears at most once per bucket (M3 swap-and-pop consistency).

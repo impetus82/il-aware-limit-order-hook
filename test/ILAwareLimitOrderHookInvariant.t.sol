@@ -429,8 +429,9 @@ abstract contract InvariantBase is StdInvariant, Test {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice The hook must always hold at least what it owes, per currency: unfilled-order custody
-    ///         + filled-unclaimed-order output + pendingFees. `>=` (not `==`) because un-rebated
-    ///         vault yield accretes as a safe surplus.
+    ///         + filled-unclaimed-order output + pendingFees (now including un-rebated vault yield,
+    ///         which is captured to pendingFees on claim rather than stranded). `>=` (not `==`) because
+    ///         ERC-4626 share-redemption rounding can leave sub-wei dust as a safe surplus.
     function invariant_solvency() public view {
         (uint256 o0, uint256 o1, uint256 o2) = _obligations();
         assertGe(t0.balanceOf(address(hook)), o0, "t0 insolvent");

@@ -223,9 +223,12 @@ function withdrawFees(Currency currency, address recipient) external; // pending
 function forceCancelOrder(uint256 orderId) external;         // UNFILLED orders only
 ```
 
-> **Execution fee.** Each fill skims `feeBps` (default **5 BPS = 0.05%**, admin-settable up to 0.5%)
-> from the output into `pendingFees`, withdrawable by the owner via `withdrawFees`. Fees are held in a
-> balance structurally separate from order custody (see [Security](#security--audit)).
+> **Protocol revenue (`pendingFees`).** Each fill skims `feeBps` (default **5 BPS = 0.05%**,
+> admin-settable up to 0.5%) from the output into `pendingFees`. On claim, any vault yield beyond the
+> `min(yield, IL)` rebate is likewise captured into `pendingFees` (rather than left stranded in the hook).
+> Both are withdrawable by the owner via `withdrawFees` and are held in a balance structurally separate
+> from order custody — each credited only after the matching physical `take`/`redeem`
+> (see [Security](#security--audit)).
 
 ---
 
@@ -269,7 +272,8 @@ found. Full triage in [docs/AUDIT_SCOPE.md](docs/AUDIT_SCOPE.md).
 after every action:
 
 1. **Solvency** — `balanceOf(hook) >= custody(unfilled) + output(filled-unclaimed) + pendingFees`
-   per currency (vault-deposited output excluded; `>=` because un-rebated yield is a safe surplus).
+   per currency (vault-deposited output excluded; `pendingFees` now captures the un-rebated yield on
+   claim, so `>=` remains only for sub-wei ERC-4626 redemption-rounding dust).
 2. **Pool isolation & bucket hygiene** — every bucket entry belongs to its pool, is live + unfilled,
    and unique.
 3. **Vault-share consistency** — `Σ order.vaultShares == vault.sharesOf(hook)`.
