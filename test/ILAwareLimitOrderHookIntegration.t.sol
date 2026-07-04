@@ -1638,6 +1638,66 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         console2.log("Yield surplus captured to pendingFees:", surplus);
     }
 
+    /// @notice B3 (saturating eligibility cast): a swap on a hook pool whose price is so high that
+    ///         sqrtPriceX96 exceeds uint128 max must NOT revert. Before the fix, _afterSwap computed
+    ///         `currentPrice = sqrtPriceToUint128(sqrtPriceX96)` unconditionally on every swap, whose
+    ///         `sqrtPrice * sqrtPrice` panics (0x11) in this regime — a self-DoS on the pool. The
+    ///         eligibility scan now uses the saturating `_saturatingPrice`, so the swap completes.
+    function test_B3_ExtremePricePool_SwapDoesNotRevert() public {
+        // A price high enough that sqrtPriceX96 > uint128 max — the panic regime of the old converter.
+        int24 initTick = 460000;
+        uint160 initSqrtPrice = TickMath.getSqrtPriceAtTick(initTick);
+        assertGt(uint256(initSqrtPrice), uint256(type(uint128).max), "setup: price must be in the panic regime");
+
+        PoolKey memory extremeKey = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 100,
+            tickSpacing: 1,
+            hooks: hook
+        });
+        // _afterInitialize must itself survive the extreme price (it does not use the reverting helper).
+        manager.initialize(extremeKey, initSqrtPrice);
+
+        // Liquidity spanning the current tick. At this price the position is almost entirely token1.
+        token0.mint(address(this), 1e24);
+        token1.mint(address(this), 1e24);
+        token0.approve(address(modifyLiquidityRouter), type(uint256).max);
+        token1.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            extremeKey,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: 455000, tickUpper: 465000, liquidityDelta: 1e10, salt: bytes32(0)
+            }),
+            ""
+        );
+
+        // Sell a little token0, but cap the move with a price limit that keeps the pool in the extreme
+        // regime — so _afterSwap reads a POST-swap sqrtPriceX96 still above uint128 max. This is exactly
+        // the input that used to panic 0x11 in the eligibility scan; it must now complete.
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            extremeKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true,
+                amountSpecified: -1e15,
+                sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(459000)
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        // Reaching here means the eligibility scan did not revert (no 0x11) at the extreme price. The
+        // zeroForOne swap cannot push price below the limit tick 459000, whose sqrtPrice is itself above
+        // uint128 max — so _afterSwap necessarily read a POST-swap price still in the panic regime,
+        // genuinely exercising the saturating path rather than a benign low-price fallback.
+        assertGt(
+            uint256(TickMath.getSqrtPriceAtTick(459000)),
+            uint256(type(uint128).max),
+            "price limit keeps the post-swap price in the panic regime"
+        );
+    }
+
     /// @notice June fix: a vault revert during claimOrder must not trap the user's funds.
     /// @dev    Proves the solvency-safe graceful fallback: when a deposited order's vault redeem
     ///         reverts, (1) claimOrder does NOT revert, (2) it emits VaultRedeemFailed, (3) it pays

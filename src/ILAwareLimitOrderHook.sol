@@ -629,9 +629,11 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             return (this.afterSwap.selector, 0);
         }
 
-        // Read the ACTUAL post-swap price and tick
+        // Read the ACTUAL post-swap price and tick. Use the SATURATING converter: this runs on every
+        // user swap, so a revert here (extreme-price pool) would DoS the swap. currentPrice only feeds
+        // eligibility trigger comparisons, so saturating an absurd price to uint128 max is correct.
         (uint160 sqrtPriceX96, int24 currentTick,,) = poolManager.getSlot0(poolKey.toId());
-        uint128 currentPrice = sqrtPriceToUint128(sqrtPriceX96);
+        uint128 currentPrice = _saturatingPrice(sqrtPriceX96);
 
         // Execute matching orders using the linked list
         _tryExecuteOrders(poolKey, currentPrice, params.zeroForOne);
@@ -866,7 +868,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             uint256 refund0 = uint256(amountIn) - actualInput;
             if (refund0 > 0) IERC20(order.token0).safeTransfer(orderOwner, refund0);
 
-            emit OrderFilled(orderId, orderOwner, uint96(actualInput), netAmount.toUint96(), _executionPrice(currentSqrtPriceX96));
+            emit OrderFilled(orderId, orderOwner, uint96(actualInput), netAmount.toUint96(), _saturatingPrice(currentSqrtPriceX96));
         } else {
             // swapDelta.amount1() is negative (hook owes token1 to pool)
             int128 deltaAmount1 = swapDelta.amount1();
@@ -899,7 +901,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             uint256 refund1 = uint256(amountIn) - actualInput;
             if (refund1 > 0) IERC20(order.token1).safeTransfer(orderOwner, refund1);
 
-            emit OrderFilled(orderId, orderOwner, uint96(actualInput), netAmount.toUint96(), _executionPrice(currentSqrtPriceX96));
+            emit OrderFilled(orderId, orderOwner, uint96(actualInput), netAmount.toUint96(), _saturatingPrice(currentSqrtPriceX96));
         }
 
         isExecuting = false;
@@ -970,11 +972,12 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Convert sqrtPriceX96 (Uniswap Q64.96 format) to a uint128 price scaled to 1e18.
-    /// @dev Reverting accounting/eligibility helper: the `sqrtPrice * sqrtPrice` step panics (0x11)
-    ///      for a pool priced above ~1.85e19, and `.toUint128()` reverts above uint128 max. Such
-    ///      prices are only reachable on an extreme, self-attacked pool (H1/H2 isolate real pools).
-    ///      Event fields use the saturating `_executionPrice` helper instead, so the fill path does
-    ///      not inherit this revert.
+    /// @dev Public, strict (reverting) utility for off-chain / tooling callers: the `sqrtPrice * sqrtPrice`
+    ///      step panics (0x11) for a pool priced above ~1.85e19, and `.toUint128()` reverts above uint128
+    ///      max. Such prices are only reachable on an extreme, self-attacked pool (H1/H2 isolate real
+    ///      pools). The internal afterSwap eligibility scan and the OrderFilled event field no longer use
+    ///      this helper — they use the saturating `_saturatingPrice`, so a swap on an extreme pool is not
+    ///      DoS'd. Kept public (unchanged behavior) for external strict-validation callers.
     /// @param sqrtPriceX96 The Uniswap Q64.96 sqrt price
     /// @return price The price scaled to 1e18 (token1 per token0)
     function sqrtPriceToUint128(uint160 sqrtPriceX96) public pure returns (uint128 price) {
@@ -1040,10 +1043,14 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         return uint160(sqrtRaw);
     }
 
-    /// @notice Saturating sqrtPriceX96 → uint128 price for event fields only (never reverts).
-    /// @dev Used for the OrderFilled executionPrice so an extreme-price pool cannot revert (DoS) the
-    ///      fill path inside afterSwap. Accounting paths keep the reverting sqrtPriceToUint128.
-    function _executionPrice(uint160 sqrtPriceX96) internal pure returns (uint128) {
+    /// @notice Saturating sqrtPriceX96 → uint128 price (1e18-scaled), never reverts.
+    /// @dev Shared by the afterSwap eligibility scan (currentPrice) and the OrderFilled executionPrice
+    ///      event field. Identical arithmetic to the public sqrtPriceToUint128, but on an extreme pool
+    ///      (sqrtPrice or the scaled price above uint128 max) it saturates to type(uint128).max instead
+    ///      of panicking — so an absurdly-priced pool cannot revert (DoS) the swap. The saturated value
+    ///      only ever feeds a trigger comparison or an event field, never an amount or payout, and every
+    ///      resulting fill stays bounded by the M4 hard price gate + min(yield, IL) + RebateExceedsRedeemed.
+    function _saturatingPrice(uint160 sqrtPriceX96) internal pure returns (uint128) {
         uint256 sqrtPrice = uint256(sqrtPriceX96);
         // sqrtPrice^2 overflows uint256 once sqrtPrice > uint128 max; such a pool's price is
         // astronomically high, so saturate rather than revert.

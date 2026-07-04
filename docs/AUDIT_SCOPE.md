@@ -222,11 +222,16 @@ affected user's own funds**; all are candidate items for the auditor to independ
    realistic order/pool and is **fail-closed** (reverts rather than silently truncating); it is not
    introduced by any fix. It could, in principle, block that one order's fill on an absurdly large output.
 
-3. **`sqrtPriceToUint128` panic on an extreme own-pool.** The reverting price helper used for
-   `afterSwap` eligibility panics (`0x11`) when computing `sqrtPrice²` for a pool priced above
-   ~1.85e19. This is a **self-DoS confined to a griefer's OWN hook-attached pool** — H1/H2 pool
-   isolation means it cannot affect any other pool's orders or swaps. Event fields use the saturating
-   `_executionPrice` helper instead, so the *fill* path does not inherit this revert.
+3. **`sqrtPriceToUint128` extreme-pool panic — FIXED (B3).** Previously the `afterSwap` eligibility scan
+   converted the post-swap price with the reverting `sqrtPriceToUint128`, which panics (`0x11`) computing
+   `sqrtPrice²` for a pool priced above ~1.85e19 — a self-DoS on the griefer's own hook-attached pool
+   (H1/H2 isolation already confined it to that pool). The eligibility scan **and** the `OrderFilled`
+   event now use the shared saturating `_saturatingPrice` helper (clamps to `type(uint128).max` instead
+   of panicking), so a swap on an extreme pool no longer reverts. The saturated value only ever feeds a
+   trigger comparison, and any resulting fill stays bounded by the M4 price gate + `min(yield, IL)` +
+   `RebateExceedsRedeemed`. The public `sqrtPriceToUint128` is kept (unchanged, strict/reverting) as an
+   off-chain utility. Proven by `test_B3_ExtremePricePool_SwapDoesNotRevert` (mutation-verified: reverts
+   `0x11` with the old helper).
 
 4. **Partial fills close + refund (no re-queue).** A genuinely eligible order that is larger than the
    pool depth within tolerance fills **partially at trigger-or-better**, refunds the unused input, and
@@ -308,11 +313,11 @@ documented pattern:
 | Detector | Where | Triage |
 |----------|-------|--------|
 | `uninitialized-state` | `tickToOrders` | False positive — a `mapping` is populated by index (`.push` in `createLimitOrder`), never "initialized" wholesale |
-| `divide-before-multiply` (×5) | `sqrtPriceToUint128`, `uint128ToSqrtPrice`, `_tolerantSqrtLimit`, `_executionPrice`, `_alignTick` | Intentional fixed-point (Q64.96) and tick-alignment math; precision behaviour is understood and documented |
+| `divide-before-multiply` (×5) | `sqrtPriceToUint128`, `uint128ToSqrtPrice`, `_tolerantSqrtLimit`, `_saturatingPrice`, `_alignTick` | Intentional fixed-point (Q64.96) and tick-alignment math; precision behaviour is understood and documented |
 | `reentrancy` (benign, ×3) | `_processTickBucket`, `_tryExecuteOrders` | State updates after `poolManager` calls inside the execution loop, which is guarded by `nonReentrant` + the `isExecuting` flag (see THREAT_MODEL §3.3–3.4) |
 | `unused-return` (×3) | `_afterSwap`/`_executeOrder` `getSlot0`; `_executeOrder` `settle()` | Intentional — only the needed slot0 fields are used; `settle()`'s return is not needed (standard v4 pattern) |
 | `missing-zero-address` | constructor `_yieldVault` | Intentional — `address(0)` is the valid "no vault" mode, checked before every vault call |
-| `dead-code` (×2) | `_tolerantSqrtLimit`, `_executionPrice` | False positive (via-IR inlining artifact) — both are called in `_executeOrder` (lines ~798 and ~859/892) and are covered by the M4 tests |
+| `dead-code` (×2) | `_tolerantSqrtLimit`, `_saturatingPrice` | False positive (via-IR inlining artifact) — `_tolerantSqrtLimit` is called in `_executeOrder` (~810) and `_saturatingPrice` in `_afterSwap` eligibility (~636) + the `OrderFilled` event (~869/902); covered by the M4 + B3 tests |
 | `cyclomatic-complexity` | `_executeOrder` | Informational |
 
 *Auditor action: independently re-run and re-confirm the triage; nothing here required a code change.*
