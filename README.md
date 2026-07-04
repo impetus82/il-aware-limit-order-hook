@@ -319,6 +319,29 @@ The script automatically:
 2. Mines the CREATE2 salt via `HookMiner` to satisfy all 7 permission flags
 3. Deploys `ILAwareLimitOrderHook` at the mined address
 
+### Deploy to Base — real Aave yield
+
+Aave is not deployed on Unichain, so the Unichain deployment uses the simulated vault. On **Base**, the
+hook can point directly at the real Aave USDC Static aToken (**waBasUSDC**, an ERC-4626 `StataTokenV2`,
+`asset() == USDC`) — making the auto-yield rebate real. The hook is vault-agnostic (immutable `yieldVault`,
+ERC-4626 only), so this is a fresh deploy, not a code change. The lifecycle is proven end-to-end against
+real Base Aave in `test/ILAwareLimitOrderHookAaveFork.t.sol` (run with `RUN_FORK_TESTS=1`).
+
+```bash
+cp .env.example .env    # then set DEPLOYER_PRIVATE_KEY (YIELD_VAULT/POOL_MANAGER default to Base)
+
+# 1) DRY RUN first (no --broadcast): forks Base, checks waBasUSDC.asset() == USDC, mines the salt
+forge script script/DeployBaseAave.s.sol:DeployBaseAave --rpc-url https://mainnet.base.org -vvvv
+
+# 2) Broadcast + verify once the simulation looks right
+forge script script/DeployBaseAave.s.sol:DeployBaseAave \
+  --rpc-url https://mainnet.base.org --broadcast --verify -vvvv
+```
+
+`DeployBaseAave` deploys **no** demo vault; it wires `yieldVault = waBasUSDC` and runs pre-flight ERC-4626
+sanity checks before broadcasting. On Base `WETH < USDC`, so a WETH/USDC pool has `currency0 = WETH`
+(opposite Unichain) and the vault path routes only USDC-output orders.
+
 ### Deployed Addresses
 
 | Network | Contract | Address |
@@ -373,7 +396,8 @@ Key scenarios covered:
 |-- src/
 |   |-- ILAwareLimitOrderHook.sol       # Main hook contract
 |-- script/
-|   |-- DeployHookathon.s.sol           # One-shot Unichain deployment
+|   |-- DeployHookathon.s.sol           # One-shot Unichain deployment (demo SimulatedYieldVault)
+|   |-- DeployBaseAave.s.sol            # Base production deploy — real Aave vault (waBasUSDC)
 |   |-- HookMiner.sol                   # CREATE2 salt miner
 |   |-- AddLiquidityUnichain.s.sol
 |   |-- TriggerSwapUnichain.s.sol
@@ -381,7 +405,8 @@ Key scenarios covered:
 |-- test/
 |   |-- ILAwareLimitOrderHook.t.sol              # Unit tests (5 tests)
 |   |-- ILAwareLimitOrderHookIntegration.t.sol   # Integration tests (58 tests)
-|   +-- ILAwareLimitOrderHookInvariant.t.sol     # Phase-2 Foundry invariants (solvency / isolation / vault shares)
+|   |-- ILAwareLimitOrderHookInvariant.t.sol     # Phase-2 Foundry invariants (solvency / isolation / vault shares)
+|   +-- ILAwareLimitOrderHookAaveFork.t.sol       # Real Aave (Base) fork test — RUN_FORK_TESTS=1
 |-- docs/
 |   |-- AUDIT_SCOPE.md                           # Audit scope, actors, assets at risk, accepted risks
 |   +-- THREAT_MODEL.md                          # Attack surface, security properties, attack scenarios
