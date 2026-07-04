@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   useAccount,
   useChainId,
@@ -73,9 +73,75 @@ export default function OrderList({
     if (address) refetchIds();
   }, [refetchKey, address, refetchIds]);
 
+  // ── Track received / composed order NFTs ──────────────
+  // getUserOrders only returns orders this wallet CREATED (the contract appends to
+  // userOrders[creator] and never updates on ERC-721 transfer), so an order NFT
+  // transferred INTO this wallet won't auto-appear. Public RPCs cap eth_getLogs to
+  // ~10k blocks, so a historical Transfer scan isn't viable here — instead let the
+  // owner add such an order by its NFT id (persisted per chain + wallet). The
+  // per-item ownerOf check still gates every action, so tracking a foreign id is
+  // harmless (it just renders read-only).
+  const [tracked, setTracked] = useState<string[]>([]);
+  const [manualInput, setManualInput] = useState("");
+  const [addError, setAddError] = useState<string | null>(null);
+  const storageKey = `ilaware:trackedOrders:${chainId}:${address?.toLowerCase() ?? "none"}`;
+
+  useEffect(() => {
+    if (!address) {
+      setTracked([]);
+      return;
+    }
+    try {
+      const raw =
+        typeof window !== "undefined" ? window.localStorage.getItem(storageKey) : null;
+      const parsed: unknown = raw ? JSON.parse(raw) : [];
+      setTracked(
+        Array.isArray(parsed)
+          ? parsed.filter((x): x is string => /^\d+$/.test(String(x)))
+          : [],
+      );
+    } catch {
+      setTracked([]);
+    }
+  }, [storageKey, address]);
+
   if (!address) return null;
 
   const ids = (orderIds as bigint[] | undefined) ?? [];
+
+  const persistTracked = (next: string[]) => {
+    setTracked(next);
+    try {
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(storageKey, JSON.stringify(next));
+      }
+    } catch {
+      /* ignore quota / private-mode write errors */
+    }
+  };
+
+  const handleAddTracked = () => {
+    const raw = manualInput.trim();
+    if (!/^\d+$/.test(raw)) {
+      setAddError("Enter a numeric NFT id");
+      return;
+    }
+    const idStr = BigInt(raw).toString();
+    if (ids.some((i) => i.toString() === idStr) || tracked.includes(idStr)) {
+      setAddError("That order is already listed");
+      return;
+    }
+    persistTracked([...tracked, idStr]);
+    setManualInput("");
+    setAddError(null);
+  };
+
+  const untrack = (idStr: string) => persistTracked(tracked.filter((t) => t !== idStr));
+
+  // Merge created orders (getUserOrders) with manually-tracked ids, created first.
+  const createdStrs = new Set(ids.map((i) => i.toString()));
+  const trackedIds = tracked.filter((t) => !createdStrs.has(t));
+  const mergedIds: bigint[] = [...ids, ...trackedIds.map((t) => BigInt(t))];
 
   return (
     <div className="rounded-xl border border-gray-800 bg-gray-900 p-6">
@@ -105,6 +171,34 @@ export default function OrderList({
         )}
       </div>
 
+      {/* Track a received / composed order NFT by id (not returned by getUserOrders) */}
+      <div className="mb-4">
+        <div className="flex gap-2">
+          <input
+            type="text"
+            inputMode="numeric"
+            value={manualInput}
+            onChange={(e) => {
+              setManualInput(e.target.value);
+              setAddError(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") handleAddTracked();
+            }}
+            placeholder="Track an order by NFT id (e.g. one transferred to you)"
+            aria-label="Order NFT id to track"
+            className="flex-1 min-w-0 rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-gray-500"
+          />
+          <button
+            onClick={handleAddTracked}
+            className="shrink-0 rounded-lg bg-gray-700 border border-gray-600 px-4 py-2 text-sm text-gray-200 hover:bg-gray-600 transition-colors"
+          >
+            Track
+          </button>
+        </div>
+        {addError && <p className="mt-1 text-xs text-red-400">{addError}</p>}
+      </div>
+
       {isLoading ? (
         <div className="space-y-3">
           {[1, 2].map((i) => (
@@ -114,22 +208,27 @@ export default function OrderList({
             />
           ))}
         </div>
-      ) : ids.length === 0 ? (
+      ) : mergedIds.length === 0 ? (
         <p className="text-sm text-gray-500 text-center py-6">
           No orders yet. Place your first limit order above.
         </p>
       ) : (
         <div className="space-y-3">
-          {ids.map((id) => (
-            <OrderItem
-              key={id.toString()}
-              orderId={id}
-              chainId={chainId}
-              connectedAddress={address}
-              refetchKey={refetchKey}
-              onActionCompleted={() => refetchIds()}
-            />
-          ))}
+          {mergedIds.map((id) => {
+            const idStr = id.toString();
+            const isTracked = trackedIds.includes(idStr);
+            return (
+              <OrderItem
+                key={idStr}
+                orderId={id}
+                chainId={chainId}
+                connectedAddress={address}
+                refetchKey={refetchKey}
+                onActionCompleted={() => refetchIds()}
+                onUntrack={isTracked ? () => untrack(idStr) : undefined}
+              />
+            );
+          })}
         </div>
       )}
     </div>
@@ -143,12 +242,15 @@ function OrderItem({
   connectedAddress,
   refetchKey,
   onActionCompleted,
+  onUntrack,
 }: {
   orderId: bigint;
   chainId: number;
   connectedAddress: Address;
   refetchKey: number;
   onActionCompleted: () => void;
+  /** Set only for manually-tracked ids → renders a "stop tracking" control */
+  onUntrack?: () => void;
 }) {
   const chain = getChainContracts(chainId);
   const hookContract = { address: chain.hook, abi: HOOK_ABI } as const;
@@ -251,6 +353,29 @@ function OrderItem({
   const order = orderRaw as OrderData | undefined;
   if (!order) return null;
 
+  // A never-minted id returns a zero struct (getOrder reads orders[id] with no
+  // existence check). Only reachable via a manually-tracked id typo → show a small
+  // "not found" card the user can remove, instead of a misleading "cancelled" one.
+  const notFound =
+    order.createdAt === 0n && order.amount0 === 0n && order.amount1 === 0n;
+  if (notFound) {
+    return (
+      <div className="rounded-lg border border-gray-800 bg-gray-900/40 p-4 flex items-center justify-between">
+        <span className="text-xs text-gray-500">
+          Order #{orderId.toString()} not found on this chain.
+        </span>
+        {onUntrack && (
+          <button
+            onClick={onUntrack}
+            className="text-xs text-gray-500 hover:text-gray-300 underline"
+          >
+            Remove
+          </button>
+        )}
+      </div>
+    );
+  }
+
   // ownerOf reverts when the NFT is burned. cancelOrder only burns UNFILLED
   // orders; claimOrder only burns FILLED ones — so isFilled distinguishes them.
   const status: OrderStatus = ownerOfError
@@ -347,6 +472,15 @@ function OrderItem({
             NFT #{orderId.toString()}
           </span>
           <StatusBadge status={status} />
+          {onUntrack && (
+            <button
+              onClick={onUntrack}
+              title="Stop tracking this order"
+              className="text-[11px] text-gray-600 hover:text-gray-400 underline"
+            >
+              untrack
+            </button>
+          )}
           {hasVaultDeposit && status === "filled" && (
             <span
               className="text-[11px] bg-purple-900/40 text-purple-400 border border-purple-800/50 px-2 py-0.5 rounded-full"
