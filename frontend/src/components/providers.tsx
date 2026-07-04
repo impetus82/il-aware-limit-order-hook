@@ -42,9 +42,12 @@ const config = getDefaultConfig({
   projectId: WALLETCONNECT_PROJECT_ID,
   // Unichain first → it's the primary Hookathon target and RainbowKit's default.
   chains: [unichain, base],
+  // `batch: true` coalesces concurrent eth_calls into a single JSON-RPC batch POST
+  // (both public RPCs accept batching), so the per-order getOrder+ownerOf polling
+  // in OrderList collapses into far fewer HTTP round-trips as the order count grows.
   transports: {
-    [unichain.id]: http(UNICHAIN_RPC_URL),
-    [base.id]: http(BASE_RPC_URL),
+    [unichain.id]: http(UNICHAIN_RPC_URL, { batch: true }),
+    [base.id]: http(BASE_RPC_URL, { batch: true }),
   },
   ssr: true,
 });
