@@ -349,8 +349,12 @@ sanity checks before broadcasting. On Base `WETH < USDC`, so a WETH/USDC pool ha
 | Unichain Mainnet | ILAwareLimitOrderHook | [0x8C19f1641946c662308000bB4E2Eaf684c81d4CE](https://uniscan.xyz/address/0x8C19f1641946c662308000bB4E2Eaf684c81d4CE) |
 | Unichain Mainnet | SimulatedYieldVault | [0xceee912C708516624E9aC5581c8FCC93eA8eE79d](https://uniscan.xyz/address/0xceee912C708516624E9aC5581c8FCC93eA8eE79d) |
 | Unichain Mainnet | USDC/WETH Pool | PoolId: `0xe1d695d4c147091549aeb6f9e78521a0184a1e7e272a71c12e708c881981f6ba` |
+| Base Mainnet | ILAwareLimitOrderHook (**real Aave vault**) | [0x17fE80F8a1ba277B1acd86D1622FaFC20CD254Ce](https://basescan.org/address/0x17fe80f8a1ba277b1acd86d1622fafc20cd254ce) |
+| Base Mainnet | waBasUSDC vault (Aave USDC Static aToken, ERC-4626) | [0xC768c589647798a6EE01A91FdE98EF2ed046DBD6](https://basescan.org/address/0xc768c589647798a6ee01a91fde98ef2ed046dbd6) |
 
-Pool init tx: [0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a4](https://uniscan.xyz/tx/0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a4)
+Unichain pool init tx: [0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a4](https://uniscan.xyz/tx/0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a4)
+
+Base deploy tx: [0x4727848c37df27a92f7634ddab497900609a7a912f6a5fecac98566bbd2176d3](https://basescan.org/tx/0x4727848c37df27a92f7634ddab497900609a7a912f6a5fecac98566bbd2176d3) — verified, funded by **real Aave USDC yield**. Base pool init (WETH/USDC, `currency0 = WETH`) is the next step.
 
 ---
 

@@ -28,10 +28,12 @@ configurable execution fee (≤ 0.5%) is skimmed from each fill and accrues to t
 |------|-------|
 | `src/ILAwareLimitOrderHook.sol` | **The only contract in scope.** ~1200 LOC. Inherits `BaseHook` (v4-periphery), `ReentrancyGuard`, `Ownable`, `ERC721` (OpenZeppelin). Contains all order lifecycle, tick-list, execution, fee, and IL-rebate logic. |
 
-`SimulatedYieldVault` is the ERC-4626 vault the live deployment points at. **It is a demo dependency and
-is OUT OF SCOPE** (see §3). It is defined only in `script/DeployHookathon.s.sol` and in tests — it is
-**not** part of `src/`. The hook treats *any* `yieldVault` address as a trusted-ish external ERC-4626
-(see §5); audit effort should focus on the hook's assumptions about the vault, not the mock's internals.
+The `yieldVault` is chain-dependent: the **Unichain** deployment points at the demo `SimulatedYieldVault`,
+while the **Base** production deployment points at the REAL Aave USDC Static aToken (**waBasUSDC**, ERC-4626).
+Either way the vault is an EXTERNAL dependency, **OUT OF SCOPE** for this audit (see §3) — the hook is
+vault-agnostic and treats *any* `yieldVault` as a trusted-ish external ERC-4626 (see §5). `SimulatedYieldVault`
+is defined only in `script/` and tests, never in `src/`. Audit effort should focus on the hook's assumptions
+about the vault (deposit / redeem, no reentrancy, lossy or failed redeem), not any specific vault's internals.
 
 ---
 
@@ -269,9 +271,13 @@ affected user's own funds**; all are candidate items for the auditor to independ
 - **Token sort order (important):** on Unichain **USDC is `currency0`** (6 decimals) and **WETH is
   `currency1`** (18 decimals) — the opposite of the Base deployment. This is the decimals footgun
   referenced in §5/§9.
-- A second deployment exists on Base mainnet (chainId 8453, hook
-  `0x45d971BdE51dd5E109036aB70a4E0b0eD2Dc4040`) where WETH is `currency0`; audit focus is the Unichain
-  deployment.
+- **Base mainnet (chainId 8453) — production, real Aave vault:** hook
+  `0x17fE80F8a1ba277B1acd86D1622FaFC20CD254Ce` (verified) wires `yieldVault` to the REAL Aave USDC Static
+  aToken `waBasUSDC` `0xC768c589647798a6EE01A91FdE98EF2ed046DBD6` (ERC-4626, `asset() == USDC`), so the
+  yield rebate is funded by real Aave lending, not the demo vault. On Base **WETH is `currency0`** (opposite
+  Unichain), so only USDC-output orders route into the vault. The hook bytecode is identical across chains
+  (vault-agnostic, immutable `yieldVault`); the earlier Base demo hook `0x45d9…4040` is superseded. Audit
+  focus is the single `src/ILAwareLimitOrderHook.sol` regardless of chain or vault.
 
 **Compiler / build settings** (`foundry.toml`):
 
