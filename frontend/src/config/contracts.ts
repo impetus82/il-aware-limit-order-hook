@@ -45,12 +45,17 @@ type ChainContracts = {
   chainLabel: string;
   // true means currency0=WETH (like Base), false means currency0=USDC (like Unichain)
   wethIsCurrency0: boolean;
+  // Vault UI copy — the on-chain yieldVault differs per chain: real Aave on Base, demo on Unichain.
+  vaultLabel: string;
+  vaultIsReal: boolean;
 };
 
 const CHAIN_CONTRACTS: Record<number, ChainContracts> = {
   // ── Base Mainnet (8453) ─────────────────────────────
   8453: {
-    hook: "0x45d971BdE51dd5E109036aB70a4E0b0eD2Dc4040",
+    // DeployBaseAave — production hook wired to REAL Aave (waBasUSDC). Supersedes the old demo
+    // hook 0x45d971BdE51dd5E109036aB70a4E0b0eD2Dc4040 (SimulatedYieldVault).
+    hook: "0x17fE80F8a1ba277B1acd86D1622FaFC20CD254Ce",
     stateView: "0xa3c0c9b65bad0b08107aa264b0f3db444b867a71",
     poolManager: "0x498581fF718922c3f8e6A244956aF099B2652b2b",
     weth: {
@@ -65,10 +70,12 @@ const CHAIN_CONTRACTS: Record<number, ChainContracts> = {
       name: "USD Coin",
       decimals: 6,
     },
-    poolId: "0x46d245ea80a77f75aa95f84bdcea9a706f7af1e25168ce25102c268a93432148",
+    poolId: "0x2635acf3c8c698bea9a28853457930c14d6eceec348de6b87e1892e88e4b81f2",
     explorerUrl: "https://basescan.org",
     chainLabel: "BASE",
     wethIsCurrency0: true,
+    vaultLabel: "real Aave USDC yield",
+    vaultIsReal: true,
   },
 
   // ── Unichain Mainnet (130) ──────────────────────────
@@ -95,6 +102,8 @@ const CHAIN_CONTRACTS: Record<number, ChainContracts> = {
     explorerUrl: "https://uniscan.xyz",
     chainLabel: "UNICHAIN",
     wethIsCurrency0: false,
+    vaultLabel: "simulated 3% APY",
+    vaultIsReal: false,
   },
 };
 
@@ -175,7 +184,7 @@ export function isSupportedChain(chainId: number | undefined): boolean {
   return chainId !== undefined && chainId in CHAIN_CONTRACTS;
 }
 
-// ── Demo vault disclosure ───────────────────────────────
-// The ERC-4626 vault on-chain is a SimulatedYieldVault (3% APY from block.timestamp),
-// not a real lending venue. UI copy must say "simulated" so nothing implies real yield.
-export const VAULT_APY_LABEL = "simulated 3% APY";
+// ── Vault disclosure ────────────────────────────────────
+// The on-chain yieldVault differs per chain, so vault copy is per-chain (see each entry's
+// `vaultLabel` / `vaultIsReal`): Base points at REAL Aave (waBasUSDC), while Unichain uses the
+// demo SimulatedYieldVault (3% APY from block.timestamp). UI must not imply real yield on Unichain.

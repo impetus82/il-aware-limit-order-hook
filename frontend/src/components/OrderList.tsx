@@ -16,7 +16,6 @@ import {
   HOOK_ABI,
   POOL_FEE,
   TICK_SPACING,
-  VAULT_APY_LABEL,
 } from "@/config/contracts";
 import { getTriggerPriceConfig } from "@/utils/price";
 import { extractTxError } from "@/utils/txError";
@@ -484,7 +483,7 @@ function OrderItem({
           {hasVaultDeposit && status === "filled" && (
             <span
               className="text-[11px] bg-purple-900/40 text-purple-400 border border-purple-800/50 px-2 py-0.5 rounded-full"
-              title={`Output is in the vault (${VAULT_APY_LABEL})`}
+              title={`Output is in the vault (${chain.vaultLabel})`}
             >
               In Vault
             </span>
@@ -569,7 +568,9 @@ function OrderItem({
                     {depositInFlight ? "Depositing…" : "Deposit to Vault (earn yield)"}
                   </button>
                   <p className="text-[11px] text-gray-600 text-center">
-                    Demo vault — {VAULT_APY_LABEL}, not real lending.
+                    {chain.vaultIsReal
+                      ? "Real Aave USDC — live lending yield."
+                      : `Demo vault — ${chain.vaultLabel}, not real lending.`}
                   </p>
                 </div>
               )}
