@@ -1,0 +1,23 @@
+{
+  "name": "il-aware-hook-sdk",
+  "version": "0.1.0",
+  "description": "Typed viem-based SDK for ILAwareLimitOrderHook (Uniswap v4) on Base and Unichain",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "viem": "^2.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "viem": "^2.47.1",
+    "vitest": "^3.2.6"
+  },
+  "license": "MIT",
+  "private": true
+}
