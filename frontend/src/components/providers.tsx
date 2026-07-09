@@ -8,13 +8,24 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RainbowKitProvider, getDefaultConfig } from "@rainbow-me/rainbowkit";
 import "@rainbow-me/rainbowkit/styles.css";
 
+// ── RPC endpoints & WalletConnect id ────────────────────
+// Overridable via env (NEXT_PUBLIC_* — inlined at build time) so a production
+// deploy can point at a dedicated/paid RPC instead of the rate-limited public
+// endpoints. Fallbacks keep the current public-RPC behavior when unset.
+const UNICHAIN_RPC_URL =
+  process.env.NEXT_PUBLIC_UNICHAIN_RPC_URL ?? "https://mainnet.unichain.org";
+const BASE_RPC_URL =
+  process.env.NEXT_PUBLIC_BASE_RPC_URL ?? "https://mainnet.base.org";
+const WALLETCONNECT_PROJECT_ID =
+  process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID ?? "9510c31cbc488ccbbe6d7744ad750af1";
+
 // ── Unichain definition (not yet in wagmi/chains) ──────
 export const unichain = defineChain({
   id: 130,
   name: "Unichain",
   nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
   rpcUrls: {
-    default: { http: ["https://mainnet.unichain.org"] },
+    default: { http: [UNICHAIN_RPC_URL] },
   },
   blockExplorers: {
     default: { name: "Uniscan", url: "https://uniscan.xyz" },
@@ -26,16 +37,17 @@ export const unichain = defineChain({
   },
 });
 
-const WALLETCONNECT_PROJECT_ID = "9510c31cbc488ccbbe6d7744ad750af1";
-
 const config = getDefaultConfig({
   appName: "IL-Aware Limit Order Hook",
   projectId: WALLETCONNECT_PROJECT_ID,
   // Unichain first → it's the primary Hookathon target and RainbowKit's default.
   chains: [unichain, base],
+  // `batch: true` coalesces concurrent eth_calls into a single JSON-RPC batch POST
+  // (both public RPCs accept batching), so the per-order getOrder+ownerOf polling
+  // in OrderList collapses into far fewer HTTP round-trips as the order count grows.
   transports: {
-    [unichain.id]: http("https://mainnet.unichain.org"),
-    [base.id]: http("https://mainnet.base.org"),
+    [unichain.id]: http(UNICHAIN_RPC_URL, { batch: true }),
+    [base.id]: http(BASE_RPC_URL, { batch: true }),
   },
   ssr: true,
 });

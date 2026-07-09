@@ -8,7 +8,6 @@ import {
   getChainContracts,
   HOOK_ABI,
   isSupportedChain,
-  VAULT_APY_LABEL,
 } from "@/config/contracts";
 import CreateOrderForm from "@/components/CreateOrderForm";
 import OrderList from "@/components/OrderList";
@@ -123,7 +122,7 @@ export default function Home() {
           <HowItWorks
             tag="ERC-4626"
             title="Idle output earns"
-            body="Filled output can be deposited to a vault (simulated 3% APY)."
+            body={`Filled output can be deposited to a vault (${chain.vaultLabel}).`}
           />
           <HowItWorks
             tag="Oracle-free"
@@ -191,7 +190,7 @@ export default function Home() {
               <div className="flex justify-between items-center">
                 <span className="text-gray-400">Yield Vault</span>
                 <span className="text-gray-300 font-mono text-sm">
-                  {VAULT_APY_LABEL}
+                  {chain.vaultLabel}
                 </span>
               </div>
 

@@ -27,3 +27,13 @@ gas_reports = ["*"]
 # Fuzz testing
 [fuzz]
 runs = 256
+
+# Invariant testing (Phase 2 — solvency / pool-isolation / bucket hygiene)
+[invariant]
+runs = 128
+depth = 48
+fail_on_revert = false
+
+# Fork RPC endpoints (M2 — real ERC-4626 Aave integration fork test)
+[rpc_endpoints]
+base = "https://mainnet.base.org"

@@ -8,7 +8,7 @@ const inter = Inter({ subsets: ["latin"] });
 export const metadata: Metadata = {
   title: "IL-Aware Limit Order Hook | Uniswap V4",
   description:
-    "Yield-bearing, IL-aware limit orders on Uniswap V4. Every order is an ERC-721 NFT; filled output earns simulated vault yield and pays an impermanent-loss rebate on claim.",
+    "Yield-bearing, IL-aware limit orders on Uniswap V4. Every order is an ERC-721 NFT; filled output earns vault yield and pays an impermanent-loss rebate on claim.",
 };
 
 export default function RootLayout({

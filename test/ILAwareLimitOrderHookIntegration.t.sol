@@ -281,6 +281,34 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         hook.createLimitOrder(badPoolKey, true, 1e18, 1e18);
     }
 
+    /// @notice L1: a triggerPrice large enough to panic (0x11) inside uint128ToSqrtPrice is now
+    ///         rejected cleanly with InvalidTriggerPrice, before any token transfer or mint.
+    ///         (type(uint128).max previously caused an opaque arithmetic-overflow panic.)
+    function test_L1_RejectsExcessiveTriggerPrice() public {
+        vm.prank(alice);
+        vm.expectRevert(ILAwareLimitOrderHook.InvalidTriggerPrice.selector);
+        hook.createLimitOrder(poolKey, true, 1e18, type(uint128).max);
+    }
+
+    /// @notice L1: boundary — one wei above the cap is rejected.
+    function test_L1_RejectsJustAboveMaxTriggerPrice() public {
+        uint128 tooHigh = hook.MAX_TRIGGER_PRICE() + 1;
+        vm.prank(alice);
+        vm.expectRevert(ILAwareLimitOrderHook.InvalidTriggerPrice.selector);
+        hook.createLimitOrder(poolKey, true, 1e18, tooHigh);
+    }
+
+    /// @notice L1: boundary — the cap itself is accepted and passes through
+    ///         uint128ToSqrtPrice/getTickAtSqrtPrice without panic, so the bound never
+    ///         over-restricts a legitimate (if extreme) order.
+    function test_L1_AcceptsMaxTriggerPrice() public {
+        uint128 cap = hook.MAX_TRIGGER_PRICE();
+        vm.prank(alice);
+        uint256 orderId = hook.createLimitOrder(poolKey, true, 1e18, cap);
+        assertEq(hook.ownerOf(orderId), alice, "order at MAX_TRIGGER_PRICE should be created");
+        assertEq(hook.getOrder(orderId).triggerPrice, cap, "triggerPrice should be stored");
+    }
+
     /*//////////////////////////////////////////////////////////////
                         CANCELLATION TESTS
     //////////////////////////////////////////////////////////////*/
@@ -470,18 +498,18 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         int24 sentinelMax = hook.SENTINEL_MAX();
 
         // Before any orders: SENTINEL_MIN -> SENTINEL_MAX
-        assertEq(hook.nextActiveTick(sentinelMin), sentinelMax, "Empty list should point min->max");
-        assertEq(hook.prevActiveTick(sentinelMax), sentinelMin, "Empty list should point max->min");
+        assertEq(hook.nextActiveTick(poolKey.toId(), sentinelMin), sentinelMax, "Empty list should point min->max");
+        assertEq(hook.prevActiveTick(poolKey.toId(), sentinelMax), sentinelMin, "Empty list should point max->min");
 
         vm.prank(alice);
         hook.createLimitOrder(poolKey, true, 1e18, 1.002e18);
 
         // Now there should be one active tick between sentinels
-        int24 firstActive = hook.nextActiveTick(sentinelMin);
+        int24 firstActive = hook.nextActiveTick(poolKey.toId(), sentinelMin);
         assertTrue(firstActive != sentinelMax, "Should have an active tick after create");
-        assertTrue(hook.isActiveTick(firstActive), "Tick should be marked active");
-        assertEq(hook.nextActiveTick(firstActive), sentinelMax, "First active -> SENTINEL_MAX");
-        assertEq(hook.prevActiveTick(firstActive), sentinelMin, "SENTINEL_MIN <- first active");
+        assertTrue(hook.isActiveTick(poolKey.toId(), firstActive), "Tick should be marked active");
+        assertEq(hook.nextActiveTick(poolKey.toId(), firstActive), sentinelMax, "First active -> SENTINEL_MAX");
+        assertEq(hook.prevActiveTick(poolKey.toId(), firstActive), sentinelMin, "SENTINEL_MIN <- first active");
     }
 
     /// @notice Verify that cancelling all orders at a tick removes it from list
@@ -493,7 +521,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         uint256 orderId = hook.createLimitOrder(poolKey, true, 1e18, 1.002e18);
 
         // Verify tick is active
-        int24 activeTick = hook.nextActiveTick(sentinelMin);
+        int24 activeTick = hook.nextActiveTick(poolKey.toId(), sentinelMin);
         assertTrue(activeTick != sentinelMax, "Tick should be in list");
 
         // Cancel the only order at that tick
@@ -501,8 +529,8 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         vm.stopPrank();
 
         // Tick should be removed from list
-        assertEq(hook.nextActiveTick(sentinelMin), sentinelMax, "Tick should be removed after cancel");
-        assertFalse(hook.isActiveTick(activeTick), "Tick should not be active after cancel");
+        assertEq(hook.nextActiveTick(poolKey.toId(), sentinelMin), sentinelMax, "Tick should be removed after cancel");
+        assertFalse(hook.isActiveTick(poolKey.toId(), activeTick), "Tick should not be active after cancel");
     }
 
     /// @notice Verify sorted insertion with multiple different trigger prices
@@ -519,13 +547,13 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
 
         // Walk the list and verify it's sorted ascending
         int24 prev = sentinelMin;
-        int24 current = hook.nextActiveTick(sentinelMin);
+        int24 current = hook.nextActiveTick(poolKey.toId(), sentinelMin);
         uint256 count = 0;
 
         while (current != sentinelMax) {
             assertTrue(current > prev || prev == sentinelMin, "List must be sorted ascending");
             prev = current;
-            current = hook.nextActiveTick(current);
+            current = hook.nextActiveTick(poolKey.toId(), current);
             count++;
         }
 
@@ -546,11 +574,11 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         vm.stopPrank();
 
         // Walk the list - should have exactly 1 active tick
-        int24 current = hook.nextActiveTick(sentinelMin);
+        int24 current = hook.nextActiveTick(poolKey.toId(), sentinelMin);
         uint256 count = 0;
         while (current != sentinelMax) {
             count++;
-            current = hook.nextActiveTick(current);
+            current = hook.nextActiveTick(poolKey.toId(), current);
         }
         assertEq(count, 1, "Same price orders should share one tick in the list");
     }
@@ -565,7 +593,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
 
         // Verify tick is in list
-        assertTrue(hook.nextActiveTick(sentinelMin) != sentinelMax, "Should have active tick");
+        assertTrue(hook.nextActiveTick(poolKey.toId(), sentinelMin) != sentinelMax, "Should have active tick");
 
         // Execute swap to fill the order
         token0.mint(address(this), 50e18);
@@ -597,7 +625,273 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
 
         // Tick should still be active (order2 remains)
         int24 tick = hook.getTickBucket(order2);
-        assertTrue(hook.isActiveTick(tick), "Tick should remain active with remaining order");
+        assertTrue(hook.isActiveTick(poolKey.toId(), tick), "Tick should remain active with remaining order");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        H1 + H2: POOL ISOLATION (audit hardening)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Spin up a second pool sharing currency0/currency1 but with a different fee tier
+    ///      (distinct PoolId), fully initialized and funded with liquidity.
+    function _setUpSecondPool() internal returns (PoolKey memory poolKeyB) {
+        poolKeyB = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 500,
+            tickSpacing: 10,
+            hooks: hook
+        });
+        manager.initialize(poolKeyB, TickMath.getSqrtPriceAtTick(0));
+
+        token0.mint(address(this), 10_000e18);
+        token1.mint(address(this), 10_000e18);
+        token0.approve(address(modifyLiquidityRouter), type(uint256).max);
+        token1.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKeyB,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -1200, tickUpper: 1200, liquidityDelta: 10_000e18, salt: bytes32(0)
+            }),
+            ""
+        );
+    }
+
+    /// @notice H2: an order in pool A must NOT be filled by a swap in a different pool B
+    ///         (both share currency0), and must still fill from its own pool's swap.
+    function test_H2_CrossPoolIsolation() public {
+        PoolKey memory poolKeyB = _setUpSecondPool();
+
+        // BUY-token0 order in pool A (fills on a price-down swap)
+        vm.prank(alice);
+        uint256 orderId = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
+        assertFalse(hook.getOrder(orderId).isFilled, "not filled at creation");
+
+        token0.mint(address(this), 100e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+
+        // Swap in pool B (price down) — must NOT touch pool A's order (H2 fix)
+        swapRouter.swap(
+            poolKeyB,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertFalse(hook.getOrder(orderId).isFilled, "H2: pool A order must NOT fill from a pool B swap");
+
+        // Swap in pool A — SHOULD fill it
+        swapRouter.swap(
+            poolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertTrue(hook.getOrder(orderId).isFilled, "order should fill from its own pool's swap");
+    }
+
+    /// @notice H1: claimOrder must reject a poolKey that doesn't match the order's pool,
+    ///         and accept the correct one.
+    function test_H1_ClaimOrder_RejectsForeignPoolKey() public {
+        // Create + fill a BUY-token0 order in pool A
+        vm.prank(alice);
+        uint256 orderId = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
+
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            poolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertTrue(hook.getOrder(orderId).isFilled, "order should be filled");
+
+        // A foreign poolKey (same tokens, different fee -> different PoolId) must revert
+        PoolKey memory foreignKey = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 500,
+            tickSpacing: 10,
+            hooks: hook
+        });
+        vm.prank(alice);
+        vm.expectRevert(ILAwareLimitOrderHook.PoolKeyMismatch.selector);
+        hook.claimOrder(orderId, foreignKey);
+
+        // The correct poolKey succeeds (no revert)
+        vm.prank(alice);
+        hook.claimOrder(orderId, poolKey);
+
+        // NFT burned after a successful claim — ownerOf reverts
+        vm.expectRevert();
+        hook.ownerOf(orderId);
+    }
+
+    /// @notice M2: withdrawing accumulated fees must never dip into the token balance backing
+    ///         user order outputs — after a full fee withdrawal every order still claims in full.
+    function test_M2_WithdrawFees_CannotEatOrderPrincipal() public {
+        // Two BUY-token0 orders (output token0 is custodied in the hook on fill; fees accrue
+        // in token0's pendingFees).
+        vm.startPrank(alice);
+        uint256 o1 = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
+        uint256 o2 = hook.createLimitOrder(poolKey, false, 2e18, 1.002e18);
+        vm.stopPrank();
+
+        // Fill both via a price-down swap
+        token0.mint(address(this), 200e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            poolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -200e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertTrue(hook.getOrder(o1).isFilled && hook.getOrder(o2).isFilled, "both orders should fill");
+
+        uint256 fees = hook.getPendingFees(poolKey.currency0);
+        assertTrue(fees > 0, "fees should accrue in token0");
+
+        uint256 out1 = hook.getOrder(o1).amount0; // buy-token0 output stored in amount0
+        uint256 out2 = hook.getOrder(o2).amount0;
+        assertTrue(out1 > 0 && out2 > 0, "outputs recorded");
+
+        // Solvency: the hook must hold every order's output PLUS the fees.
+        assertTrue(
+            token0.balanceOf(address(hook)) >= out1 + out2 + fees, "hook must cover all outputs + fees"
+        );
+
+        // Owner drains ALL fees.
+        uint256 ownerBefore = token0.balanceOf(address(this));
+        hook.withdrawFees(poolKey.currency0, address(this));
+        assertEq(token0.balanceOf(address(this)) - ownerBefore, fees, "owner withdraws exactly the fees");
+
+        // After the fee withdrawal both owners still claim their FULL output — principal untouched.
+        uint256 aliceBefore = token0.balanceOf(alice);
+        vm.startPrank(alice);
+        hook.claimOrder(o1, poolKey);
+        hook.claimOrder(o2, poolKey);
+        vm.stopPrank();
+        assertEq(
+            token0.balanceOf(alice) - aliceBefore, out1 + out2, "both outputs claimable in full after fees withdrawn"
+        );
+    }
+
+    /// @notice M2: fees + vault deposit + full fee withdrawal coexist solvently — a deposited
+    ///         order still claims in full after the owner drains all fees (vault + fees interaction).
+    function test_M2_Solvency_VaultPlusFees() public {
+        MockERC4626 vault = new MockERC4626(address(token0));
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory args = abi.encode(address(manager), address(this), address(vault));
+        vm.pauseGasMetering();
+        (address predicted, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
+        ILAwareLimitOrderHook hookWithVault =
+            new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
+        require(address(hookWithVault) == predicted, "mismatch");
+        vm.resumeGasMetering();
+
+        PoolKey memory vpk = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 500,
+            tickSpacing: 10,
+            hooks: hookWithVault
+        });
+        manager.initialize(vpk, TickMath.getSqrtPriceAtTick(0));
+        token0.mint(address(this), 5_000e18);
+        token1.mint(address(this), 5_000e18);
+        token0.approve(address(modifyLiquidityRouter), type(uint256).max);
+        token1.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            vpk,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)
+            }),
+            ""
+        );
+
+        token1.mint(alice, 10e18);
+        vm.startPrank(alice);
+        token1.approve(address(hookWithVault), type(uint256).max);
+        uint256 orderId = hookWithVault.createLimitOrder(vpk, false, 1e18, 1.002e18);
+        vm.stopPrank();
+
+        // Fill (fee accrues in token0), then deposit the output into the vault.
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            vpk,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertTrue(hookWithVault.getOrder(orderId).isFilled, "order should fill");
+        assertTrue(hookWithVault.getPendingFees(Currency.wrap(address(token0))) > 0, "fee accrued in token0");
+
+        vm.prank(alice);
+        hookWithVault.depositToVault(orderId);
+        assertTrue(hookWithVault.getOrder(orderId).vaultShares > 0, "output deposited to vault");
+
+        // Owner drains ALL token0 fees.
+        hookWithVault.withdrawFees(Currency.wrap(address(token0)), address(this));
+
+        // The deposited order still claims in full (funded by the vault redemption; guard holds).
+        uint256 aliceBefore = token0.balanceOf(alice);
+        vm.prank(alice);
+        hookWithVault.claimOrder(orderId, vpk);
+        assertTrue(
+            token0.balanceOf(alice) > aliceBefore, "deposited order still claims in full after fees withdrawn"
+        );
+    }
+
+    /// @notice M3: O(1) bucket removal keeps the orderBucketIndex map consistent. Cancelling a
+    ///         non-last order (swap-and-pop moves the last element into its slot) must not corrupt
+    ///         the remaining orders' removability — including the very order that was moved.
+    function test_M3_BucketRemovalIsConsistent() public {
+        // Three BUY orders at the SAME trigger -> same (pool, tick) bucket.
+        vm.startPrank(alice);
+        uint256 o1 = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
+        uint256 o2 = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
+        uint256 o3 = hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
+        vm.stopPrank();
+
+        int24 tick = hook.getTickBucket(o1);
+        PoolId pid = poolKey.toId();
+        assertEq(hook.getOrdersInTick(pid, tick).length, 3, "bucket has 3 orders");
+
+        // Cancel the FIRST order (index 0) -> swap-and-pop moves o3 into slot 0.
+        vm.prank(alice);
+        hook.cancelOrder(o1);
+        assertEq(hook.getOrdersInTick(pid, tick).length, 2, "bucket has 2 after first cancel");
+
+        // Cancel o3 — now living at index 0 after the move. This only works if orderBucketIndex[o3]
+        // was updated during the swap-and-pop; a stale index would remove the wrong order or revert.
+        vm.prank(alice);
+        hook.cancelOrder(o3);
+        uint256[] memory remaining = hook.getOrdersInTick(pid, tick);
+        assertEq(remaining.length, 1, "bucket has 1 after moved-order cancel");
+        assertEq(remaining[0], o2, "o2 is the surviving order (index map stayed consistent)");
+        assertTrue(hook.isActiveTick(pid, tick), "tick still active with o2 remaining");
+
+        // Cancel the last one -> bucket empties -> tick unlinked.
+        vm.prank(alice);
+        hook.cancelOrder(o2);
+        assertEq(hook.getOrdersInTick(pid, tick).length, 0, "bucket empty after last cancel");
+        assertFalse(hook.isActiveTick(pid, tick), "tick removed from the list when empty");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -681,7 +975,7 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         hook.ownerOf(orderId);
 
         int24 tick = hook.getTickBucket(orderId);
-        assertFalse(hook.isActiveTick(tick), "Tick should be removed after force cancel");
+        assertFalse(hook.isActiveTick(poolKey.toId(), tick), "Tick should be removed after force cancel");
     }
 
     /// @notice Phase 3.14: Non-admin cannot force-cancel
@@ -970,41 +1264,26 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         assertTrue(tickAfter >= tickBefore, "lastTick should increase after price-up swap");
     }
 
-    /// @notice Verifies lpPositions are recorded when hookData contains the LP address
-    function test_AfterAddLiquidity_WithHookData() public {
-        address lpAddress = makeAddr("lp_provider");
-
+    /// @notice J1: afterAddLiquidity is now a no-op (the spoofable `lpPositions` telemetry was
+    ///         removed). Adding liquidity — with or without an LP address in hookData — still
+    ///         succeeds and writes no hook state; the retained flag keeps the callback valid.
+    function test_AfterAddLiquidity_NoOp_Graceful() public {
         token0.mint(address(this), 1000e18);
         token1.mint(address(this), 1000e18);
         token0.approve(address(modifyLiquidityRouter), type(uint256).max);
         token1.approve(address(modifyLiquidityRouter), type(uint256).max);
+        uint256 t0Before = token0.balanceOf(address(this));
 
+        // hookData carrying an LP address is accepted but ignored by the no-op callback (no revert).
         modifyLiquidityRouter.modifyLiquidity(
             poolKey,
             IPoolManager.ModifyLiquidityParams({
                 tickLower: -600, tickUpper: 600, liquidityDelta: 1000e18, salt: bytes32(0)
             }),
-            abi.encode(lpAddress)
+            abi.encode(makeAddr("lp_provider"))
         );
 
-        PoolId poolId = poolKey.toId();
-        ILAwareLimitOrderHook.LPPosition memory pos = hook.getLPPosition(poolId, lpAddress);
-
-        assertTrue(pos.sqrtPriceAtEntry > 0, "sqrtPriceAtEntry should be recorded");
-        assertEq(pos.liquidity, uint128(1000e18), "liquidity should match liquidityDelta");
-        assertEq(pos.entryTimestamp, block.timestamp, "entryTimestamp should be current block");
-    }
-
-    /// @notice Verifies that LP tracking is skipped gracefully when hookData is empty
-    function test_AfterAddLiquidity_NoHookData_Graceful() public {
-        address lpAddress = makeAddr("unknown_lp");
-
-        // setUp already called addLiquidity() with empty hookData — no lpPositions recorded
-        PoolId poolId = poolKey.toId();
-        ILAwareLimitOrderHook.LPPosition memory pos = hook.getLPPosition(poolId, lpAddress);
-
-        assertEq(pos.sqrtPriceAtEntry, 0, "No tracking without hookData");
-        assertEq(pos.liquidity, 0, "No liquidity recorded without hookData");
+        assertLt(token0.balanceOf(address(this)), t0Before, "liquidity add still succeeds through the no-op hook");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1118,6 +1397,80 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         assertTrue(orderAfter.vaultShares > 0, "vaultShares should be recorded after depositToVault");
     }
 
+    /// @notice H3: a filled + vault-deposited order (vaultShares > 0) cannot be force-cancelled,
+    ///         and its principal is NOT stranded — the owner can still claim it in full.
+    ///         Proves the "forceCancelOrder orphans vault shares" finding is unreachable.
+    function test_H3_ForceCancel_CannotStrandVaultShares() public {
+        MockERC4626 vault = new MockERC4626(address(token0));
+
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory args = abi.encode(address(manager), address(this), address(vault));
+        vm.pauseGasMetering();
+        (address predicted, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
+        ILAwareLimitOrderHook hookWithVault =
+            new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
+        require(address(hookWithVault) == predicted, "mismatch");
+        vm.resumeGasMetering();
+
+        PoolKey memory vaultPoolKey = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 500,
+            tickSpacing: 10,
+            hooks: hookWithVault
+        });
+        manager.initialize(vaultPoolKey, TickMath.getSqrtPriceAtTick(0));
+
+        token0.mint(address(this), 5_000e18);
+        token1.mint(address(this), 5_000e18);
+        token0.approve(address(modifyLiquidityRouter), type(uint256).max);
+        token1.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            vaultPoolKey,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)
+            }),
+            ""
+        );
+
+        token1.mint(alice, 10e18);
+        vm.startPrank(alice);
+        token1.approve(address(hookWithVault), type(uint256).max);
+        token0.approve(address(hookWithVault), type(uint256).max);
+        uint256 orderId = hookWithVault.createLimitOrder(vaultPoolKey, false, 1e18, 1.002e18);
+        vm.stopPrank();
+
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            vaultPoolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        vm.prank(alice);
+        hookWithVault.depositToVault(orderId);
+        assertTrue(hookWithVault.getOrder(orderId).vaultShares > 0, "vaultShares should be set");
+
+        // H3: force-cancelling a filled + deposited order MUST revert (cannot strand vaultShares)
+        vm.expectRevert(ILAwareLimitOrderHook.OrderAlreadyFilled.selector);
+        hookWithVault.forceCancelOrder(orderId);
+
+        // And the principal is NOT stranded: the owner can still claim it in full via claimOrder
+        uint256 aliceBefore = token0.balanceOf(alice);
+        vm.prank(alice);
+        hookWithVault.claimOrder(orderId, vaultPoolKey);
+        assertTrue(token0.balanceOf(alice) > aliceBefore, "owner can still claim deposited output (not stranded)");
+    }
+
     /// @notice claimOrder distributes vault yield as IL rebate
     function test_YieldRebate_OnClaim() public {
         MockERC4626 vault = new MockERC4626(address(token0));
@@ -1189,6 +1542,160 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
 
         assertTrue(aliceAfter > aliceBefore, "Alice should receive tokens via claimOrder");
         console2.log("Alice received on claim:", aliceAfter - aliceBefore);
+    }
+
+    /// @notice Stranded-yield fix: vault yield beyond the min(yield, IL) rebate must be captured as
+    ///         protocol revenue in pendingFees (and be withdrawable), not left stranded in the hook.
+    /// @dev    Uses a high vault yield (50%) so redeemed >> output + IL rebate, guaranteeing a non-zero
+    ///         surplus. Asserts: (1) claiming credits the surplus to pendingFees[output], (2) the owner
+    ///         can withdraw that pendingFees balance in full, and (3) the surplus is real (> 0). Closes
+    ///         the HIGH finding where un-rebated yield was un-withdrawable dust accreting in the hook.
+    function test_M2Fix_UnrebatedYield_CreditedToPendingFees_AndWithdrawable() public {
+        MockERC4626 vault = new MockERC4626(address(token0));
+        vault.setYieldBps(5000); // 50% yield → far exceeds any IL rebate on this fill
+
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory args = abi.encode(address(manager), address(this), address(vault));
+        vm.pauseGasMetering();
+        (address predicted, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
+        ILAwareLimitOrderHook hookWithVault =
+            new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
+        require(address(hookWithVault) == predicted, "mismatch");
+        vm.resumeGasMetering();
+
+        PoolKey memory vaultPoolKey = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 100,
+            tickSpacing: 1,
+            hooks: hookWithVault
+        });
+        manager.initialize(vaultPoolKey, TickMath.getSqrtPriceAtTick(0));
+
+        token0.mint(address(this), 5_000e18);
+        token1.mint(address(this), 5_000e18);
+        modifyLiquidityRouter.modifyLiquidity(
+            vaultPoolKey,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)
+            }),
+            ""
+        );
+
+        token1.mint(alice, 10e18);
+        vm.startPrank(alice);
+        token1.approve(address(hookWithVault), type(uint256).max);
+        token0.approve(address(hookWithVault), type(uint256).max);
+        uint256 orderId = hookWithVault.createLimitOrder(vaultPoolKey, false, 1e18, 1.002e18);
+        vm.stopPrank();
+
+        // Fill the order.
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            vaultPoolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        vm.prank(alice);
+        hookWithVault.depositToVault(orderId);
+        assertTrue(hookWithVault.getOrder(orderId).vaultShares > 0, "Shares should be deposited");
+
+        Currency out = Currency.wrap(address(token0));
+
+        // Snapshot pendingFees immediately before claim: the delta isolates the yield surplus credit.
+        uint256 feesBeforeClaim = hookWithVault.getPendingFees(out);
+
+        vm.prank(alice);
+        hookWithVault.claimOrder(orderId, vaultPoolKey);
+
+        uint256 feesAfterClaim = hookWithVault.getPendingFees(out);
+        uint256 surplus = feesAfterClaim - feesBeforeClaim;
+
+        // (1) + (3): the un-rebated yield was captured into pendingFees, and it is a real, positive amount.
+        assertGt(surplus, 0, "un-rebated vault yield must be credited to pendingFees, not stranded");
+
+        // (2): the owner can withdraw the full accrued pendingFees balance.
+        address feeSink = makeAddr("feeSink");
+        uint256 sinkBefore = token0.balanceOf(feeSink);
+        hookWithVault.withdrawFees(out, feeSink); // caller is owner (address(this))
+
+        assertEq(
+            token0.balanceOf(feeSink) - sinkBefore,
+            feesAfterClaim,
+            "owner must withdraw exactly the accrued pendingFees (incl. yield surplus)"
+        );
+        assertEq(hookWithVault.getPendingFees(out), 0, "pendingFees must be zeroed after withdrawal");
+        console2.log("Yield surplus captured to pendingFees:", surplus);
+    }
+
+    /// @notice B3 (saturating eligibility cast): a swap on a hook pool whose price is so high that
+    ///         sqrtPriceX96 exceeds uint128 max must NOT revert. Before the fix, _afterSwap computed
+    ///         `currentPrice = sqrtPriceToUint128(sqrtPriceX96)` unconditionally on every swap, whose
+    ///         `sqrtPrice * sqrtPrice` panics (0x11) in this regime — a self-DoS on the pool. The
+    ///         eligibility scan now uses the saturating `_saturatingPrice`, so the swap completes.
+    function test_B3_ExtremePricePool_SwapDoesNotRevert() public {
+        // A price high enough that sqrtPriceX96 > uint128 max — the panic regime of the old converter.
+        int24 initTick = 460000;
+        uint160 initSqrtPrice = TickMath.getSqrtPriceAtTick(initTick);
+        assertGt(uint256(initSqrtPrice), uint256(type(uint128).max), "setup: price must be in the panic regime");
+
+        PoolKey memory extremeKey = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 100,
+            tickSpacing: 1,
+            hooks: hook
+        });
+        // _afterInitialize must itself survive the extreme price (it does not use the reverting helper).
+        manager.initialize(extremeKey, initSqrtPrice);
+
+        // Liquidity spanning the current tick. At this price the position is almost entirely token1.
+        token0.mint(address(this), 1e24);
+        token1.mint(address(this), 1e24);
+        token0.approve(address(modifyLiquidityRouter), type(uint256).max);
+        token1.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            extremeKey,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: 455000, tickUpper: 465000, liquidityDelta: 1e10, salt: bytes32(0)
+            }),
+            ""
+        );
+
+        // Sell a little token0, but cap the move with a price limit that keeps the pool in the extreme
+        // regime — so _afterSwap reads a POST-swap sqrtPriceX96 still above uint128 max. This is exactly
+        // the input that used to panic 0x11 in the eligibility scan; it must now complete.
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            extremeKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true,
+                amountSpecified: -1e15,
+                sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(459000)
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        // Reaching here means the eligibility scan did not revert (no 0x11) at the extreme price. The
+        // zeroForOne swap cannot push price below the limit tick 459000, whose sqrtPrice is itself above
+        // uint128 max — so _afterSwap necessarily read a POST-swap price still in the panic regime,
+        // genuinely exercising the saturating path rather than a benign low-price fallback.
+        assertGt(
+            uint256(TickMath.getSqrtPriceAtTick(459000)),
+            uint256(type(uint128).max),
+            "price limit keeps the post-swap price in the panic regime"
+        );
     }
 
     /// @notice June fix: a vault revert during claimOrder must not trap the user's funds.
@@ -1570,6 +2077,11 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         assertGt(aliceReceived, outputAmount,
             "Alice should receive outputAmount + IL-rebate (yield covered impermanent loss)");
 
+        // M1/J2: the rebate is a bounded heuristic — it can NEVER exceed the realized vault yield,
+        // regardless of how the IL estimate is sized (output-notional heuristic) or of any
+        // triggering-price manipulation. rebate = min(yield, IL) <= yield, by construction.
+        assertLe(aliceReceived - outputAmount, expectedYield, "M1/J2: rebate must not exceed realized yield");
+
         // NFT burned after claim
         vm.expectRevert();
         hookWithVault.ownerOf(orderId);
@@ -1604,5 +2116,87 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         uint256 aliceAfter = token0.balanceOf(alice);
 
         assertTrue(aliceAfter > aliceBefore, "Alice should receive output without vault");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    M4: HARD PRICE GATE TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice M4: a large SELL order on a shallow pool now fills only PARTIALLY within the
+    ///         trigger-anchored tolerance band and REFUNDS the unused input — instead of the old
+    ///         behaviour of filling the whole order at a price worse than the user's limit and
+    ///         emitting a "SlippageExceeded" warning. Proves the swap can never fill below
+    ///         triggerPrice*(1 - MAX_SLIPPAGE_BPS) (the hard gate).
+    function test_M4_HardGate_PartialFillProtectsPrice() public {
+        hook.setFeeBps(0); // clean gross-price math (owner == this test contract)
+
+        uint96 amountIn = 500e18; // >> the ~0.5% tolerance-band depth of the 10_000e18 pool
+        uint128 triggerPrice = 1.002e18;
+
+        vm.prank(alice);
+        uint256 orderId = hook.createLimitOrder(poolKey, true, amountIn, triggerPrice);
+        uint256 aliceT0AfterCreate = token0.balanceOf(alice);
+
+        // Push price up past the trigger (same proven trigger as testSellOrderExecution).
+        token1.mint(address(this), 60e18);
+        token1.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            poolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: false, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
+        assertTrue(order.isFilled, "Large order should be (partially) filled");
+
+        // Partial fill: unused input was refunded to the owner => the gate bound the swap.
+        uint256 refund = token0.balanceOf(alice) - aliceT0AfterCreate;
+        assertGt(refund, 0, "Gate must refund the unfillable remainder (partial fill)");
+        assertLt(refund, amountIn, "Some of the order must have filled");
+
+        uint256 actualInput = uint256(amountIn) - refund;
+        assertGt(actualInput, 0, "Some input must have been consumed");
+
+        // Hard-gate guarantee: realized price (token1 out / token0 in) >= trigger*(1 - slippage).
+        uint256 realizedScaled = uint256(order.amount1) * 1e18 / actualInput;
+        uint256 floor = uint256(triggerPrice) * (10000 - hook.MAX_SLIPPAGE_BPS()) / 10000;
+        assertGe(realizedScaled, floor, "Fill must never be below the trigger-tolerant floor");
+    }
+
+    /// @notice M4: a normal small order is unaffected — it fills FULLY (no refund) at
+    ///         trigger-or-better, so the tighter gate does not regress ordinary execution.
+    function test_M4_HardGate_SmallOrderFillsFully() public {
+        hook.setFeeBps(0);
+
+        uint96 amountIn = 1e18;
+        uint128 triggerPrice = 1.002e18;
+
+        vm.prank(alice);
+        uint256 orderId = hook.createLimitOrder(poolKey, true, amountIn, triggerPrice);
+        uint256 aliceT0AfterCreate = token0.balanceOf(alice);
+
+        token1.mint(address(this), 60e18);
+        token1.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            poolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: false, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        ILAwareLimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
+        assertTrue(order.isFilled, "Small order should fully fill");
+
+        uint256 refund = token0.balanceOf(alice) - aliceT0AfterCreate;
+        assertEq(refund, 0, "A small order well within pool depth must not be refunded");
+
+        uint256 realizedScaled = uint256(order.amount1) * 1e18 / uint256(amountIn);
+        uint256 floor = uint256(triggerPrice) * (10000 - hook.MAX_SLIPPAGE_BPS()) / 10000;
+        assertGe(realizedScaled, floor, "Fill must respect the trigger-tolerant floor");
     }
 }

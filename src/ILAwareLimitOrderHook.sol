@@ -31,10 +31,10 @@ import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 ///   wastes gas on empty ticks and fails for large price movements), we maintain
 ///   a sorted doubly-linked list of only those ticks that actually contain orders.
 ///
-///   Storage layout:
-///     - `nextActiveTick[tick]` -> next higher active tick (or SENTINEL_MAX)
-///     - `prevActiveTick[tick]` -> next lower active tick (or SENTINEL_MIN)
-///     - Two sentinel values anchor the list boundaries
+///   Storage layout (per-pool since H2 — each pool has its own list):
+///     - `nextActiveTick[poolId][tick]` -> next higher active tick (or SENTINEL_MAX)
+///     - `prevActiveTick[poolId][tick]` -> next lower active tick (or SENTINEL_MIN)
+///     - Two sentinel values anchor each pool's list boundaries
 ///
 ///   This gives us:
 ///     - O(1) insertion: given the sorted position (found via binary hint or walk)
@@ -87,7 +87,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice Thrown when order amount is zero
     error InvalidAmount();
 
-    /// @notice Thrown when trigger price is zero
+    /// @notice Thrown when trigger price is zero or exceeds MAX_TRIGGER_PRICE (L1)
     error InvalidTriggerPrice();
 
     /// @notice Thrown when a non-creator tries to cancel an order
@@ -117,6 +117,12 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice Thrown when trying to claim an order that was already claimed
     error OrderAlreadyClaimed();
 
+    /// @notice Thrown when the poolKey passed to claimOrder does not match the order's pool (H1)
+    error PoolKeyMismatch();
+
+    /// @notice Thrown if a vault-path claim payout would exceed what the vault just redeemed (M2 solvency)
+    error RebateExceedsRedeemed();
+
     /*//////////////////////////////////////////////////////////////
                             DATA STRUCTURES
     //////////////////////////////////////////////////////////////*/
@@ -134,6 +140,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         bool zeroForOne;
         uint256 vaultShares; // ERC4626 vault shares for yield (0 = not deposited)
         uint160 sqrtPriceAtFill; // sqrtPriceX96 at execution time (for IL calc)
+        PoolId poolId; // H1/H2: the pool this order belongs to (isolation + claim validation)
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -143,18 +150,25 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice All orders by ID
     mapping(uint256 => LimitOrder) public orders;
 
-    /// @notice Order IDs owned by each user
+    /// @notice Order IDs ever created by each user (append-only, read ONLY off-chain).
+    /// @dev Never iterated on-chain, so its unbounded growth is not a DoS vector (M3);
+    ///      off-chain callers should paginate getUserOrders() or use ERC-721 enumeration.
     mapping(address => uint256[]) private userOrders;
 
     /// @notice Auto-incrementing order counter
     uint256 public nextOrderId;
 
-    /// @notice Tick-based order indexing for O(1) lookup
-    /// @dev Key is the aligned tick (rounded to tickSpacing grid)
-    mapping(int24 => uint256[]) public tickToOrders;
+    /// @notice Tick-based order indexing for O(1) lookup, namespaced per pool (H2)
+    /// @dev Key is (PoolId, aligned tick). Orders never collide across pools.
+    mapping(PoolId => mapping(int24 => uint256[])) public tickToOrders;
 
     /// @notice Reverse mapping: orderId -> aligned tick bucket
     mapping(uint256 => int24) private orderTickBucket;
+
+    /// @notice Reverse mapping: orderId -> its index within tickToOrders[poolId][tick] (M3).
+    /// @dev Enables O(1) swap-and-pop removal from a bucket without a linear scan, so
+    ///      cancelOrder/forceCancelOrder cannot be griefed by flooding a tick with many orders.
+    mapping(uint256 => uint256) private orderBucketIndex;
 
     /*//////////////////////////////////////////////////////////////
                     SORTED LINKED LIST OF ACTIVE TICKS
@@ -167,16 +181,21 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     int24 public constant SENTINEL_MIN = type(int24).min; // -8388608
     int24 public constant SENTINEL_MAX = type(int24).max; //  8388607
 
-    /// @notice Forward pointer: tick -> next higher active tick
-    mapping(int24 => int24) public nextActiveTick;
+    /// @notice Forward pointer: (pool, tick) -> next higher active tick (H2: per-pool list)
+    mapping(PoolId => mapping(int24 => int24)) public nextActiveTick;
 
-    /// @notice Backward pointer: tick -> next lower active tick
-    mapping(int24 => int24) public prevActiveTick;
+    /// @notice Backward pointer: (pool, tick) -> next lower active tick (H2: per-pool list)
+    mapping(PoolId => mapping(int24 => int24)) public prevActiveTick;
 
-    /// @notice Quick check: does this tick have orders?
-    /// @dev True when tickToOrders[tick].length > 0 AND tick is linked.
+    /// @notice Quick check: does this (pool, tick) have orders? (H2: per-pool)
+    /// @dev True when tickToOrders[poolId][tick].length > 0 AND tick is linked.
     ///      Prevents double-insertion and enables O(1) removal check.
-    mapping(int24 => bool) public isActiveTick;
+    mapping(PoolId => mapping(int24 => bool)) public isActiveTick;
+
+    /// @notice Whether a pool's active-tick linked-list sentinels have been initialized (H2).
+    /// @dev Guards against the default-zero trap: an uninitialized list would have
+    ///      nextActiveTick[poolId][SENTINEL_MIN] == 0 (a valid tick), breaking the walk.
+    mapping(PoolId => bool) private poolListInitialized;
 
     /// @dev Reentrancy guard for execution
     bool private isExecuting;
@@ -193,24 +212,22 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice Maximum allowed slippage in basis points (50 = 0.5%)
     uint256 public constant MAX_SLIPPAGE_BPS = 50;
 
+    /// @notice Upper bound on `triggerPrice` (1e18-scaled) accepted by createLimitOrder (L1).
+    /// @dev Set well below (~18x margin) both the `uint128ToSqrtPrice` overflow point
+    ///      (~2^64·1e18 ≈ 1.84e37, where `priceX192 * 2^96` would panic 0x11 at order creation)
+    ///      and the `_tolerantSqrtLimit` clamp point (~1.83e37, above which the M4 price gate
+    ///      would clamp to a pool bound and lose its floor/ceiling protection). 1e36 (an actual
+    ///      price of 1e18) is astronomically above any realistic pair (e.g. WETH/USDC ~3.6e21),
+    ///      so no legitimate order is rejected, while every accepted order stays in the exact,
+    ///      non-degenerate range of the sqrt-price math.
+    uint128 public constant MAX_TRIGGER_PRICE = 1e36;
+
     /*//////////////////////////////////////////////////////////////
                     IL-AWARE ADDITIONS (UHI9 Hookathon)
     //////////////////////////////////////////////////////////////*/
 
     /// @notice ERC-4626 vault for earning yield on idle order liquidity
     address public immutable yieldVault;
-
-    /// @notice LP position data recorded at liquidity addition time
-    struct LPPosition {
-        uint160 sqrtPriceAtEntry;
-        uint128 liquidity;
-        uint256 entryTimestamp;
-        uint256 idleAmount;
-        uint256 vaultShares;
-    }
-
-    /// @notice LP position per pool per LP address (populated via afterAddLiquidity + hookData)
-    mapping(PoolId => mapping(address => LPPosition)) public lpPositions;
 
     /// @notice Last known tick per pool, initialized in afterInitialize and updated after each swap
     mapping(PoolId => int24) public lastTick;
@@ -228,19 +245,37 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice Current execution fee in basis points (default: 5 = 0.05%)
     uint256 public feeBps = 5;
 
-    /// @notice Accumulated fees per currency, withdrawable by owner
+    /// @notice Accumulated protocol revenue per currency, withdrawable by the owner. Holds both the
+    ///         per-fill execution fees and the un-rebated vault yield credited on claim (yield beyond
+    ///         the min(yield, IL) rebate). Every credit happens ONLY after the matching take/redeem,
+    ///         so this balance is always fully backed by the hook and never draws on order custody.
     mapping(Currency => uint256) public pendingFees;
 
     /*//////////////////////////////////////////////////////////////
                               EVENTS
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Emitted when a limit order is created and its input token is escrowed in the hook.
+    /// @param orderId The new order id (also the ERC-721 tokenId)
+    /// @param creator The minter / initial NFT owner
+    /// @param zeroForOne Sell token0 for token1 (true) or buy token0 with token1 (false)
+    /// @param amountIn The input amount escrowed
+    /// @param triggerPrice The 1e18-scaled trigger price (token1 per token0)
     event OrderCreated(
         uint256 indexed orderId, address indexed creator, bool zeroForOne, uint96 amountIn, uint128 triggerPrice
     );
 
+    /// @notice Emitted when an order is cancelled by its owner and the deposit is refunded.
+    /// @param orderId The cancelled order
+    /// @param creator The NFT owner who cancelled (refund recipient)
     event OrderCancelled(uint256 indexed orderId, address indexed creator);
 
+    /// @notice Emitted when an order is filled via the internal swap (fully or partially).
+    /// @param orderId The filled order
+    /// @param creator The NFT owner at fill time
+    /// @param amountIn Input actually consumed by the fill (may be < the original amount on a partial fill)
+    /// @param amountOut Net output credited to the order (after the execution fee)
+    /// @param executionPrice The saturating 1e18-scaled fill price (pre-internal-swap spot)
     event OrderFilled(
         uint256 indexed orderId, address indexed creator, uint96 amountIn, uint96 amountOut, uint128 executionPrice
     );
@@ -250,17 +285,34 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @param reason Human-readable failure reason
     event OrderExecutionFailed(uint256 indexed orderId, string reason);
 
-    /// @notice Emitted when admin force-cancels an orphaned order
+    /// @notice Emitted when admin force-cancels an orphaned (unfilled) order
+    /// @param orderId The force-cancelled order
+    /// @param admin The owner who triggered the force-cancel (refund goes to the order's NFT owner)
     event OrderForceCancelled(uint256 indexed orderId, address indexed admin);
 
-    /// @notice Emitted when fee rate is updated
+    /// @notice Emitted when the execution fee rate is updated
+    /// @param oldFeeBps The previous fee in basis points
+    /// @param newFeeBps The new fee in basis points (<= MAX_FEE_BPS)
     event FeeBpsUpdated(uint256 oldFeeBps, uint256 newFeeBps);
 
-    /// @notice Emitted when fees are withdrawn
+    /// @notice Emitted when accumulated fees are withdrawn by the owner
+    /// @param currency The currency withdrawn
+    /// @param recipient The address that received the fees
+    /// @param amount The amount withdrawn (the full pendingFees balance for `currency`)
     event FeesWithdrawn(Currency indexed currency, address indexed recipient, uint256 amount);
 
-    /// @notice Emitted when a fee is collected from an order execution
+    /// @notice Emitted when an execution fee is collected from a fill into pendingFees
+    /// @param orderId The order whose fill produced the fee
+    /// @param currency The currency the fee was taken in (the order's output currency)
+    /// @param feeAmount The fee amount credited to pendingFees
     event FeeCollected(uint256 indexed orderId, Currency indexed currency, uint256 feeAmount);
+
+    /// @notice Emitted when un-rebated vault yield (beyond the min(yield, IL) rebate) is credited to
+    ///         pendingFees as protocol revenue on claim.
+    /// @param orderId The claimed order whose vault redeem produced the surplus
+    /// @param currency The output currency the surplus is denominated in
+    /// @param amount The surplus amount credited to pendingFees
+    event YieldSurplusToFees(uint256 indexed orderId, Currency indexed currency, uint256 amount);
 
     /// @notice Emitted when an ERC-4626 vault redeem reverts during claimOrder.
     /// @dev    The order is left FULLY intact (NFT, amounts, and vaultShares preserved) so the
@@ -281,9 +333,8 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         ERC721("Limit Order Position", "LOP")
     {
         yieldVault = _yieldVault;
-        // Initialize sentinel linked list: SENTINEL_MIN <-> SENTINEL_MAX
-        nextActiveTick[SENTINEL_MIN] = SENTINEL_MAX;
-        prevActiveTick[SENTINEL_MAX] = SENTINEL_MIN;
+        // Active-tick linked-list sentinels are initialized PER-POOL (H2) in
+        // _afterInitialize / _ensurePoolSentinels — each pool has its own list.
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -291,7 +342,10 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Declare which hook callbacks this contract implements
-    /// @dev UHI9: added afterAddLiquidity + afterAddLiquidityReturnDelta for IL tracking
+    /// @dev afterAddLiquidity(+ReturnDelta) are retained as no-op callbacks (J1 removed the LP
+    ///      telemetry that used them); the flags are kept so the deployed hook address stays valid
+    /// @return The Hooks.Permissions enabling afterInitialize, afterAddLiquidity(+ReturnDelta),
+    ///         beforeSwap(+ReturnDelta), and afterSwap(+ReturnDelta)
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: false,
@@ -332,10 +386,14 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     {
         if (amountIn == 0) revert InvalidAmount();
         if (triggerPrice == 0) revert InvalidTriggerPrice();
+        // L1: reject prices that would panic (0x11) in uint128ToSqrtPrice below, or later reach the
+        // M4 gate's overflow clamp. Fails cleanly here, before any token transfer or mint.
+        if (triggerPrice > MAX_TRIGGER_PRICE) revert InvalidTriggerPrice();
         if (poolKey.tickSpacing <= 0) revert InvalidPoolKey();
 
         orderId = nextOrderId++;
 
+        PoolId poolId = poolKey.toId();
         address token0Addr = Currency.unwrap(poolKey.currency0);
         address token1Addr = Currency.unwrap(poolKey.currency1);
 
@@ -356,7 +414,8 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             isFilled: false,
             zeroForOne: zeroForOne,
             vaultShares: 0,
-            sqrtPriceAtFill: 0
+            sqrtPriceAtFill: 0,
+            poolId: poolId
         });
 
         // Mint ERC721 NFT representing this position (orderId = tokenId)
@@ -364,15 +423,21 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
 
         userOrders[msg.sender].push(orderId);
 
-        // Index by tick bucket
+        // Ensure this pool's linked-list sentinels exist (H2: also covers a caller-supplied
+        // poolKey whose pool was not initialized through this hook's _afterInitialize).
+        _ensurePoolSentinels(poolId);
+
+        // Index by (pool, tick) bucket, recording the order's index for O(1) removal (M3)
         int24 alignedTick =
             _alignTick(TickMath.getTickAtSqrtPrice(uint128ToSqrtPrice(triggerPrice)), poolKey.tickSpacing);
-        tickToOrders[alignedTick].push(orderId);
+        uint256[] storage bucket = tickToOrders[poolId][alignedTick];
+        orderBucketIndex[orderId] = bucket.length;
+        bucket.push(orderId);
         orderTickBucket[orderId] = alignedTick;
 
-        // Insert tick into sorted linked list if not already active
-        if (!isActiveTick[alignedTick]) {
-            _insertActiveTick(alignedTick);
+        // Insert tick into this pool's sorted linked list if not already active
+        if (!isActiveTick[poolId][alignedTick]) {
+            _insertActiveTick(poolId, alignedTick);
         }
 
         emit OrderCreated(orderId, msg.sender, zeroForOne, amountIn, triggerPrice);
@@ -389,19 +454,14 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         if (ownerOf(orderId) != msg.sender) revert NotOrderCreator();
         if (order.isFilled) revert OrderAlreadyFilled();
 
-        // Remove from tick bucket
+        // Remove from (pool, tick) bucket — O(1) via the stored index (M3)
+        PoolId poolId = order.poolId;
         int24 tick = orderTickBucket[orderId];
-        uint256[] storage orderIds = tickToOrders[tick];
-        for (uint256 i = 0; i < orderIds.length; i++) {
-            if (orderIds[i] == orderId) {
-                _removeFromArray(orderIds, i);
-                break;
-            }
-        }
+        _removeFromBucket(poolId, tick, orderBucketIndex[orderId]);
 
-        // If tick bucket is now empty, remove from linked list
-        if (tickToOrders[tick].length == 0) {
-            _removeActiveTick(tick);
+        // If tick bucket is now empty, remove from this pool's linked list
+        if (tickToOrders[poolId][tick].length == 0) {
+            _removeActiveTick(poolId, tick);
         }
 
         // Return tokens
@@ -429,20 +489,23 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         if (order.isFilled) revert OrderAlreadyFilled();
         if (_ownerOf(orderId) == address(0)) revert OrderNotActive(); // burned = already cancelled
 
+        // H3 invariant: only UNFILLED orders reach here. `vaultShares` is set solely by
+        // depositToVault (which requires isFilled == true), and isFilled is monotonic (never
+        // reset), so any order with vaultShares > 0 is filled and reverts at the guard above.
+        // Therefore no vault redemption is needed here and no deposited principal can be
+        // stranded. A filled order's output is the owner's bearer claim, recoverable only via
+        // claimOrder (which redeems vaultShares) — admin intentionally cannot seize a filled
+        // position. (See test_H3_ForceCancel_CannotStrandVaultShares.)
+
         address recipient = ownerOf(orderId);
 
-        // Remove from tick bucket
+        // Remove from (pool, tick) bucket — O(1) via the stored index (M3)
+        PoolId poolId = order.poolId;
         int24 tick = orderTickBucket[orderId];
-        uint256[] storage orderIds = tickToOrders[tick];
-        for (uint256 i = 0; i < orderIds.length; i++) {
-            if (orderIds[i] == orderId) {
-                _removeFromArray(orderIds, i);
-                break;
-            }
-        }
+        _removeFromBucket(poolId, tick, orderBucketIndex[orderId]);
 
-        if (tickToOrders[tick].length == 0) {
-            _removeActiveTick(tick);
+        if (tickToOrders[poolId][tick].length == 0) {
+            _removeActiveTick(poolId, tick);
         }
 
         // Return tokens to current NFT owner
@@ -476,6 +539,12 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @param currency The currency to withdraw fees for
     /// @param recipient The address to send fees to
     function withdrawFees(Currency currency, address recipient) external onlyOwner {
+        // M2 solvency invariant: pendingFees[currency] is credited ONLY after the matching
+        // feeAmount is physically taken into this hook (see _executeOrder), and it is the only
+        // balance this function ever touches. Order outputs are taken and tracked separately
+        // (order.amount0/amount1), and vault deposits leave the hook entirely — so withdrawing
+        // fees can never dip into funds backing user orders. Proven by
+        // test_M2_WithdrawFees_CannotEatOrderPrincipal.
         uint256 amount = pendingFees[currency];
         if (amount == 0) revert NoFeesToWithdraw();
 
@@ -490,44 +559,57 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                           VIEW FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Get full order data by ID
+    /// @notice Get full order data by ID.
+    /// @param orderId The order to look up
+    /// @return The full LimitOrder struct (amounts, tokens, triggerPrice, isFilled, zeroForOne,
+    ///         vaultShares, sqrtPriceAtFill, poolId). Fields persist after burn — check ownerOf for liveness.
     function getOrder(uint256 orderId) external view returns (LimitOrder memory) {
         return orders[orderId];
     }
 
-    /// @notice Get all order IDs for a given user
+    /// @notice Get all order IDs ever created by a user (append-only; may include filled/cancelled ids).
+    /// @param user The address whose order IDs to return
+    /// @return An append-only list of the user's orderIds — read-only, intended for off-chain paging
     function getUserOrders(address user) external view returns (uint256[] memory) {
         return userOrders[user];
     }
 
-    /// @notice Get all order IDs in a specific tick bucket
-    function getOrdersInTick(int24 tick) external view returns (uint256[] memory) {
-        return tickToOrders[tick];
+    /// @notice Get all order IDs currently indexed in a specific (pool, tick) bucket.
+    /// @param poolId The pool whose bucket to read
+    /// @param tick The aligned tick bucket
+    /// @return The live orderIds in (poolId, tick)
+    function getOrdersInTick(PoolId poolId, int24 tick) external view returns (uint256[] memory) {
+        return tickToOrders[poolId][tick];
     }
 
-    /// @notice Get the tick bucket an order was assigned to
+    /// @notice Get the aligned tick bucket an order was assigned to at creation.
+    /// @param orderId The order to look up
+    /// @return The aligned tick bucket
     function getTickBucket(uint256 orderId) external view returns (int24) {
         return orderTickBucket[orderId];
     }
 
-    /// @notice Get the next active tick above the given tick
-    function getNextActiveTick(int24 tick) external view returns (int24) {
-        return nextActiveTick[tick];
+    /// @notice Get the next active tick above the given tick (per pool).
+    /// @param poolId The pool whose active-tick list to read
+    /// @param tick The tick to step up from
+    /// @return The next higher active tick, or SENTINEL_MAX if none
+    function getNextActiveTick(PoolId poolId, int24 tick) external view returns (int24) {
+        return nextActiveTick[poolId][tick];
     }
 
-    /// @notice Get the next active tick below the given tick
-    function getPrevActiveTick(int24 tick) external view returns (int24) {
-        return prevActiveTick[tick];
+    /// @notice Get the next active tick below the given tick (per pool).
+    /// @param poolId The pool whose active-tick list to read
+    /// @param tick The tick to step down from
+    /// @return The next lower active tick, or SENTINEL_MIN if none
+    function getPrevActiveTick(PoolId poolId, int24 tick) external view returns (int24) {
+        return prevActiveTick[poolId][tick];
     }
 
-    /// @notice Get accumulated fees for a specific currency
+    /// @notice Get accumulated, withdrawable fees for a specific currency.
+    /// @param currency The currency to query
+    /// @return The accumulated pendingFees for `currency`
     function getPendingFees(Currency currency) external view returns (uint256) {
         return pendingFees[currency];
-    }
-
-    /// @notice Get LP position data for a specific pool and LP address
-    function getLPPosition(PoolId poolId, address lp) external view returns (LPPosition memory) {
-        return lpPositions[poolId][lp];
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -547,9 +629,11 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             return (this.afterSwap.selector, 0);
         }
 
-        // Read the ACTUAL post-swap price and tick
+        // Read the ACTUAL post-swap price and tick. Use the SATURATING converter: this runs on every
+        // user swap, so a revert here (extreme-price pool) would DoS the swap. currentPrice only feeds
+        // eligibility trigger comparisons, so saturating an absurd price to uint128 max is correct.
         (uint160 sqrtPriceX96, int24 currentTick,,) = poolManager.getSlot0(poolKey.toId());
-        uint128 currentPrice = sqrtPriceToUint128(sqrtPriceX96);
+        uint128 currentPrice = _saturatingPrice(sqrtPriceX96);
 
         // Execute matching orders using the linked list
         _tryExecuteOrders(poolKey, currentPrice, params.zeroForOne);
@@ -570,26 +654,29 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     ///      - !zeroForOne swap (price UP) -> scan downward for SELL orders (trigger when price >= X)
     ///      - zeroForOne swap (price DOWN) -> scan upward for BUY orders (trigger when price <= X)
     function _tryExecuteOrders(PoolKey calldata poolKey, uint128 currentPrice, bool swapZeroForOne) internal {
-        address token0 = Currency.unwrap(poolKey.currency0);
+        PoolId poolId = poolKey.toId();
+        // Defense-in-depth: never walk an uninitialized list (self-defending against any
+        // future caller that reaches here for a pool that skipped _afterInitialize).
+        if (!poolListInitialized[poolId]) return;
 
         int24 activeTickCount = 0;
 
         if (swapZeroForOne) {
             // Price went DOWN -> scan upward for BUY orders (triggerPrice >= currentPrice)
             // Start from the lowest active tick and go up
-            int24 tick = nextActiveTick[SENTINEL_MIN];
+            int24 tick = nextActiveTick[poolId][SENTINEL_MIN];
 
             while (tick != SENTINEL_MAX && activeTickCount < MAX_ACTIVE_TICK_SCAN) {
                 if (gasleft() < GAS_LIMIT_PER_ORDER) break;
 
                 // Cache next before potential removal
-                int24 nextTick = nextActiveTick[tick];
+                int24 nextTick = nextActiveTick[poolId][tick];
 
-                _processTickBucket(tick, token0, currentPrice, poolKey);
+                _processTickBucket(poolId, tick, currentPrice, poolKey);
 
                 // If bucket is now empty after processing, remove from list
-                if (tickToOrders[tick].length == 0) {
-                    _removeActiveTick(tick);
+                if (tickToOrders[poolId][tick].length == 0) {
+                    _removeActiveTick(poolId, tick);
                 }
 
                 activeTickCount++;
@@ -598,19 +685,19 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         } else {
             // Price went UP -> scan downward for SELL orders (triggerPrice <= currentPrice)
             // Start from the highest active tick and go down
-            int24 tick = prevActiveTick[SENTINEL_MAX];
+            int24 tick = prevActiveTick[poolId][SENTINEL_MAX];
 
             while (tick != SENTINEL_MIN && activeTickCount < MAX_ACTIVE_TICK_SCAN) {
                 if (gasleft() < GAS_LIMIT_PER_ORDER) break;
 
                 // Cache prev before potential removal
-                int24 prevTick = prevActiveTick[tick];
+                int24 prevTick = prevActiveTick[poolId][tick];
 
-                _processTickBucket(tick, token0, currentPrice, poolKey);
+                _processTickBucket(poolId, tick, currentPrice, poolKey);
 
                 // If bucket is now empty after processing, remove from list
-                if (tickToOrders[tick].length == 0) {
-                    _removeActiveTick(tick);
+                if (tickToOrders[poolId][tick].length == 0) {
+                    _removeActiveTick(poolId, tick);
                 }
 
                 activeTickCount++;
@@ -624,8 +711,8 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     ///      lazy cleanup of filled/cancelled orders.
     ///      Phase 3.14: Failed executions emit OrderExecutionFailed and skip
     ///      (order stays in bucket for retry on next swap).
-    function _processTickBucket(int24 tick, address token0, uint128 currentPrice, PoolKey calldata poolKey) internal {
-        uint256[] storage orderIdsInTick = tickToOrders[tick];
+    function _processTickBucket(PoolId poolId, int24 tick, uint128 currentPrice, PoolKey calldata poolKey) internal {
+        uint256[] storage orderIdsInTick = tickToOrders[poolId][tick];
 
         uint256 i = 0;
         while (i < orderIdsInTick.length) {
@@ -636,15 +723,12 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
 
             // Lazy cleanup: remove filled or burned (cancelled) orders
             if (order.isFilled || _ownerOf(orderId) == address(0)) {
-                _removeFromArray(orderIdsInTick, i);
+                _removeFromBucket(poolId, tick, i);
                 continue;
             }
 
-            // Skip if wrong pool
-            if (order.token0 != token0) {
-                i++;
-                continue;
-            }
+            // (H2) No token0 pool-filter needed: the bucket is namespaced by PoolId, so every
+            // order in it provably belongs to this pool (the old currency0-only check was unsound).
 
             // Check price eligibility (inlined for gas efficiency)
             bool eligible = false;
@@ -660,7 +744,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                 // Phase 3.14: graceful execution - skip on failure instead of revert
                 bool success = _executeOrder(poolKey, order, orderId);
                 if (success) {
-                    _removeFromArray(orderIdsInTick, i);
+                    _removeFromBucket(poolId, tick, i);
                     // Don't increment i - swap-and-pop moved new element here
                 } else {
                     // Order failed (slippage etc.) - leave it for next swap
@@ -715,13 +799,25 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         address orderOwner = ownerOf(orderId);
         uint96 amountIn = order.zeroForOne ? order.amount0 : order.amount1;
 
-        // Get current price for slippage limit
+        // Current pool price: used for the pre-swap price-gate check (Stage A) and recorded as the
+        // pre-internal-swap fill price for the IL rebate in claimOrder (order.sqrtPriceAtFill).
         (uint160 currentSqrtPriceX96,,,) = poolManager.getSlot0(poolKey.toId());
 
-        // Price limit: 5% slippage on the internal swap
-        uint160 sqrtPriceLimitX96 = order.zeroForOne
-            ? ((uint256(currentSqrtPriceX96) * 95) / 100).toUint160()
-            : ((uint256(currentSqrtPriceX96) * 105) / 100).toUint160();
+        // M4 HARD PRICE GATE: anchor the internal-swap limit to the ORDER's trigger price
+        // (± MAX_SLIPPAGE_BPS), NOT to spot. The swap then physically cannot execute worse than the
+        // user's price — replacing the old advisory "fill anyway on SlippageExceeded" behaviour.
+        // _tolerantSqrtLimit is non-reverting, so it is safe inside afterSwap.
+        uint160 sqrtPriceLimitX96 = _tolerantSqrtLimit(order.triggerPrice, order.zeroForOne);
+
+        // Stage A: if the limit already sits on the wrong side of spot, poolManager.swap would revert
+        // (PriceLimitAlreadyExceeded) — forbidden here, as it would DoS the user's swap. Skip instead:
+        // no swap is issued, so there is zero pool delta and the order simply stays resting. For a
+        // genuinely eligible order this is essentially unreachable (defensive guard).
+        if (order.zeroForOne ? sqrtPriceLimitX96 >= currentSqrtPriceX96 : sqrtPriceLimitX96 <= currentSqrtPriceX96) {
+            isExecuting = false;
+            emit OrderExecutionFailed(orderId, "PriceGate");
+            return false;
+        }
 
         IPoolManager.SwapParams memory swapParams = IPoolManager.SwapParams({
             zeroForOne: order.zeroForOne,
@@ -731,14 +827,24 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
 
         BalanceDelta swapDelta = poolManager.swap(poolKey, swapParams, "");
 
-        // Record fill price for IL calculation in claimOrder
+        // Record the pre-internal-swap price for the IL calculation in claimOrder.
         order.sqrtPriceAtFill = currentSqrtPriceX96;
 
-        // Settle input + Take output to this contract (output claimed via claimOrder)
+        // Settle input + take output to this contract (output claimed via claimOrder). Because the
+        // swap could not cross sqrtPriceLimitX96, every filled unit executed at trigger-or-better
+        // within tolerance; a large order may fill only partially (unused input is refunded).
         if (order.zeroForOne) {
             // swapDelta.amount0() is negative (hook owes token0 to pool)
             int128 deltaAmount0 = swapDelta.amount0();
             uint256 actualInput = uint256(uint128(-deltaAmount0));
+
+            // Stage B: the swap consumed nothing (hit the price gate immediately) => zero delta on
+            // both currencies. Skip clean, no settle/take, order stays resting for a later swap.
+            if (actualInput == 0) {
+                isExecuting = false;
+                emit OrderExecutionFailed(orderId, "PriceGate");
+                return false;
+            }
 
             poolManager.sync(poolKey.currency0);
             IERC20(order.token0).safeTransfer(address(poolManager), actualInput);
@@ -750,35 +856,6 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             uint256 feeAmount = (amountOut * feeBps) / 10000;
             uint256 netAmount = amountOut - feeAmount;
 
-            uint256 expectedOut = (uint256(amountIn) * uint256(order.triggerPrice)) / 1e18;
-            uint256 minAmountOut = (expectedOut * (10000 - MAX_SLIPPAGE_BPS)) / 10000;
-
-            if (amountOut < minAmountOut) {
-                // Slippage: still fill, emit warning. Output held in hook for claimOrder.
-                poolManager.take(poolKey.currency1, address(this), netAmount);
-                if (feeAmount > 0) {
-                    poolManager.take(poolKey.currency1, address(this), feeAmount);
-                    pendingFees[poolKey.currency1] += feeAmount;
-                    emit FeeCollected(orderId, poolKey.currency1, feeAmount);
-                }
-                order.isFilled = true;
-                order.amount1 = netAmount.toUint96();
-                uint256 refund = uint256(amountIn) - actualInput;
-                if (refund > 0) IERC20(order.token0).safeTransfer(orderOwner, refund);
-
-                emit OrderExecutionFailed(orderId, "SlippageExceeded");
-                emit OrderFilled(
-                    orderId,
-                    orderOwner,
-                    uint96(actualInput),
-                    netAmount.toUint96(),
-                    sqrtPriceToUint128(currentSqrtPriceX96)
-                );
-                isExecuting = false;
-                return true;
-            }
-
-            // Normal: output held in hook for claimOrder
             poolManager.take(poolKey.currency1, address(this), netAmount);
             if (feeAmount > 0) {
                 poolManager.take(poolKey.currency1, address(this), feeAmount);
@@ -787,12 +864,21 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             }
             order.isFilled = true;
             order.amount1 = netAmount.toUint96();
+            // Partial fill (order larger than pool depth within tolerance): refund unused input.
             uint256 refund0 = uint256(amountIn) - actualInput;
             if (refund0 > 0) IERC20(order.token0).safeTransfer(orderOwner, refund0);
+
+            emit OrderFilled(orderId, orderOwner, uint96(actualInput), netAmount.toUint96(), _saturatingPrice(currentSqrtPriceX96));
         } else {
             // swapDelta.amount1() is negative (hook owes token1 to pool)
             int128 deltaAmount1 = swapDelta.amount1();
             uint256 actualInput = uint256(uint128(-deltaAmount1));
+
+            if (actualInput == 0) {
+                isExecuting = false;
+                emit OrderExecutionFailed(orderId, "PriceGate");
+                return false;
+            }
 
             poolManager.sync(poolKey.currency1);
             IERC20(order.token1).safeTransfer(address(poolManager), actualInput);
@@ -804,35 +890,6 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             uint256 feeAmount = (amountOut * feeBps) / 10000;
             uint256 netAmount = amountOut - feeAmount;
 
-            uint256 expectedOut = (uint256(amountIn) * 1e18) / uint256(order.triggerPrice);
-            uint256 minAmountOut = (expectedOut * (10000 - MAX_SLIPPAGE_BPS)) / 10000;
-
-            if (amountOut < minAmountOut) {
-                // Slippage: still fill, output held in hook
-                poolManager.take(poolKey.currency0, address(this), netAmount);
-                if (feeAmount > 0) {
-                    poolManager.take(poolKey.currency0, address(this), feeAmount);
-                    pendingFees[poolKey.currency0] += feeAmount;
-                    emit FeeCollected(orderId, poolKey.currency0, feeAmount);
-                }
-                order.isFilled = true;
-                order.amount0 = netAmount.toUint96();
-                uint256 refund = uint256(amountIn) - actualInput;
-                if (refund > 0) IERC20(order.token1).safeTransfer(orderOwner, refund);
-
-                emit OrderExecutionFailed(orderId, "SlippageExceeded");
-                emit OrderFilled(
-                    orderId,
-                    orderOwner,
-                    uint96(actualInput),
-                    netAmount.toUint96(),
-                    sqrtPriceToUint128(currentSqrtPriceX96)
-                );
-                isExecuting = false;
-                return true;
-            }
-
-            // Normal: output held in hook for claimOrder
             poolManager.take(poolKey.currency0, address(this), netAmount);
             if (feeAmount > 0) {
                 poolManager.take(poolKey.currency0, address(this), feeAmount);
@@ -843,15 +900,9 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             order.amount0 = netAmount.toUint96();
             uint256 refund1 = uint256(amountIn) - actualInput;
             if (refund1 > 0) IERC20(order.token1).safeTransfer(orderOwner, refund1);
-        }
 
-        emit OrderFilled(
-            orderId,
-            orderOwner,
-            uint96(order.zeroForOne ? uint256(uint128(-swapDelta.amount0())) : uint256(uint128(-swapDelta.amount1()))),
-            order.zeroForOne ? order.amount1 : order.amount0,
-            sqrtPriceToUint128(currentSqrtPriceX96)
-        );
+            emit OrderFilled(orderId, orderOwner, uint96(actualInput), netAmount.toUint96(), _saturatingPrice(currentSqrtPriceX96));
+        }
 
         isExecuting = false;
         return true;
@@ -861,55 +912,74 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                    SORTED LINKED LIST OPERATIONS
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Initialize a pool's active-tick linked-list sentinels exactly once (H2).
+    /// @dev Idempotent; called from _afterInitialize and createLimitOrder so the list is
+    ///      always valid before any insert/walk (avoids the default-zero sentinel trap).
+    function _ensurePoolSentinels(PoolId poolId) internal {
+        if (!poolListInitialized[poolId]) {
+            nextActiveTick[poolId][SENTINEL_MIN] = SENTINEL_MAX;
+            prevActiveTick[poolId][SENTINEL_MAX] = SENTINEL_MIN;
+            poolListInitialized[poolId] = true;
+        }
+    }
+
     /// @notice Insert a tick into the sorted doubly-linked list
     /// @dev Walks forward from SENTINEL_MIN to find the correct sorted position.
     ///      For most use cases (few dozen active ticks), this is cheap.
     ///      Worst case: O(N) where N = number of active ticks.
     ///      Could be optimized with a hint parameter if needed for >1000 active ticks.
-    function _insertActiveTick(int24 tick) internal {
+    function _insertActiveTick(PoolId poolId, int24 tick) internal {
         // Walk from the lowest sentinel to find insertion point
         int24 cursor = SENTINEL_MIN;
-        while (nextActiveTick[cursor] != SENTINEL_MAX && nextActiveTick[cursor] < tick) {
-            cursor = nextActiveTick[cursor];
+        while (nextActiveTick[poolId][cursor] != SENTINEL_MAX && nextActiveTick[poolId][cursor] < tick) {
+            cursor = nextActiveTick[poolId][cursor];
         }
 
         // Insert between cursor and cursor.next
         // Before: cursor <-> cursorNext
         // After:  cursor <-> tick <-> cursorNext
-        int24 cursorNext = nextActiveTick[cursor];
+        int24 cursorNext = nextActiveTick[poolId][cursor];
 
-        nextActiveTick[cursor] = tick;
-        prevActiveTick[tick] = cursor;
-        nextActiveTick[tick] = cursorNext;
-        prevActiveTick[cursorNext] = tick;
+        nextActiveTick[poolId][cursor] = tick;
+        prevActiveTick[poolId][tick] = cursor;
+        nextActiveTick[poolId][tick] = cursorNext;
+        prevActiveTick[poolId][cursorNext] = tick;
 
-        isActiveTick[tick] = true;
+        isActiveTick[poolId][tick] = true;
     }
 
     /// @notice Remove a tick from the sorted doubly-linked list
     /// @dev O(1) operation - just unlink the node.
-    function _removeActiveTick(int24 tick) internal {
-        if (!isActiveTick[tick]) return;
+    function _removeActiveTick(PoolId poolId, int24 tick) internal {
+        if (!isActiveTick[poolId][tick]) return;
 
-        int24 prev = prevActiveTick[tick];
-        int24 next = nextActiveTick[tick];
+        int24 prev = prevActiveTick[poolId][tick];
+        int24 next = nextActiveTick[poolId][tick];
 
         // Before: prev <-> tick <-> next
         // After:  prev <-> next
-        nextActiveTick[prev] = next;
-        prevActiveTick[next] = prev;
+        nextActiveTick[poolId][prev] = next;
+        prevActiveTick[poolId][next] = prev;
 
         // Clean up
-        delete nextActiveTick[tick];
-        delete prevActiveTick[tick];
-        isActiveTick[tick] = false;
+        delete nextActiveTick[poolId][tick];
+        delete prevActiveTick[poolId][tick];
+        isActiveTick[poolId][tick] = false;
     }
 
     /*//////////////////////////////////////////////////////////////
                         PRICE HELPERS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Convert sqrtPriceX96 (Uniswap format) to uint128 price scaled to 1e18
+    /// @notice Convert sqrtPriceX96 (Uniswap Q64.96 format) to a uint128 price scaled to 1e18.
+    /// @dev Public, strict (reverting) utility for off-chain / tooling callers: the `sqrtPrice * sqrtPrice`
+    ///      step panics (0x11) for a pool priced above ~1.85e19, and `.toUint128()` reverts above uint128
+    ///      max. Such prices are only reachable on an extreme, self-attacked pool (H1/H2 isolate real
+    ///      pools). The internal afterSwap eligibility scan and the OrderFilled event field no longer use
+    ///      this helper — they use the saturating `_saturatingPrice`, so a swap on an extreme pool is not
+    ///      DoS'd. Kept public (unchanged behavior) for external strict-validation callers.
+    /// @param sqrtPriceX96 The Uniswap Q64.96 sqrt price
+    /// @return price The price scaled to 1e18 (token1 per token0)
     function sqrtPriceToUint128(uint160 sqrtPriceX96) public pure returns (uint128 price) {
         uint256 sqrtPrice = uint256(sqrtPriceX96);
         uint256 priceX96 = (sqrtPrice * sqrtPrice) / (1 << 96);
@@ -917,7 +987,12 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         price = priceScaled.toUint128();
     }
 
-    /// @notice Convert uint128 price (1e18 scaled) to sqrtPriceX96
+    /// @notice Convert a uint128 price (1e18 scaled) to sqrtPriceX96.
+    /// @dev Panics (0x11) at the `priceX192 * 2^96` step for price > ~1.845e37. Only reached from
+    ///      createLimitOrder, which bounds `triggerPrice <= MAX_TRIGGER_PRICE (1e36)` so every
+    ///      creatable order stays well inside the safe range (finding L1).
+    /// @param price The 1e18-scaled price to convert
+    /// @return sqrtPriceX96 The Uniswap Q64.96 sqrt price
     function uint128ToSqrtPrice(uint128 price) public pure returns (uint160 sqrtPriceX96) {
         uint256 priceX192 = (uint256(price) * (1 << 96)) / 1e18;
         uint256 priceX96Full = priceX192 * (1 << 96);
@@ -925,7 +1000,9 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         sqrtPriceX96 = sqrtPriceRaw.toUint160();
     }
 
-    /// @notice Integer square root (Babylonian method)
+    /// @notice Integer square root (Babylonian method).
+    /// @param x The value to take the integer square root of
+    /// @return y floor(sqrt(x))
     function sqrt(uint256 x) public pure returns (uint256 y) {
         if (x == 0) return 0;
         uint256 z = (x + 1) / 2;
@@ -936,6 +1013,52 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         }
     }
 
+    /// @notice Trigger-anchored, non-reverting sqrtPriceX96 limit for the internal fill swap (M4).
+    /// @dev SELL (zeroForOne) uses triggerPrice*(1 - MAX_SLIPPAGE_BPS) as a price FLOOR; BUY uses
+    ///      triggerPrice*(1 + MAX_SLIPPAGE_BPS) as a price CEILING. Mirrors uint128ToSqrtPrice's math
+    ///      but can NEVER revert — it runs inside afterSwap, where a revert would DoS the user's swap:
+    ///      the tolerant-price multiply fits uint256, the priceX96Full overflow is guarded (clamped to
+    ///      the correct pool bound), and the result is clamped into the swappable band
+    ///      [MIN_SQRT_PRICE+1, MAX_SQRT_PRICE-1]. Makes the swap physically unable to fill worse than
+    ///      the user's price, so no post-hoc slippage check is needed.
+    function _tolerantSqrtLimit(uint128 triggerPrice, bool zeroForOne) internal pure returns (uint160) {
+        // uint256(triggerPrice) * 10050 <= ~3.42e42 << 2^256 → the tolerant-price multiply is safe.
+        uint256 tolPrice = zeroForOne
+            ? (uint256(triggerPrice) * (10000 - MAX_SLIPPAGE_BPS)) / 10000
+            : (uint256(triggerPrice) * (10000 + MAX_SLIPPAGE_BPS)) / 10000;
+
+        // priceX192 = tolPrice * 2^96 / 1e18. tolPrice <= ~2^128 so tolPrice << 96 <= ~2^224, safe.
+        uint256 priceX192 = (tolPrice * (1 << 96)) / 1e18;
+
+        // priceX192 << 96 overflows uint256 only for prices that map ABOVE MAX_SQRT_PRICE anyway;
+        // clamp to the pool bound on the CORRECT side (floor for SELL, ceiling for BUY), not revert.
+        if (priceX192 > (type(uint256).max >> 96)) {
+            return zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+        }
+        uint256 sqrtRaw = sqrt(priceX192 << 96);
+
+        // PoolManager rejects a limit <= MIN or >= MAX; clamp into the swappable band.
+        if (sqrtRaw <= TickMath.MIN_SQRT_PRICE) return TickMath.MIN_SQRT_PRICE + 1;
+        if (sqrtRaw >= TickMath.MAX_SQRT_PRICE) return TickMath.MAX_SQRT_PRICE - 1;
+        return uint160(sqrtRaw);
+    }
+
+    /// @notice Saturating sqrtPriceX96 → uint128 price (1e18-scaled), never reverts.
+    /// @dev Shared by the afterSwap eligibility scan (currentPrice) and the OrderFilled executionPrice
+    ///      event field. Identical arithmetic to the public sqrtPriceToUint128, but on an extreme pool
+    ///      (sqrtPrice or the scaled price above uint128 max) it saturates to type(uint128).max instead
+    ///      of panicking — so an absurdly-priced pool cannot revert (DoS) the swap. The saturated value
+    ///      only ever feeds a trigger comparison or an event field, never an amount or payout, and every
+    ///      resulting fill stays bounded by the M4 hard price gate + min(yield, IL) + RebateExceedsRedeemed.
+    function _saturatingPrice(uint160 sqrtPriceX96) internal pure returns (uint128) {
+        uint256 sqrtPrice = uint256(sqrtPriceX96);
+        // sqrtPrice^2 overflows uint256 once sqrtPrice > uint128 max; such a pool's price is
+        // astronomically high, so saturate rather than revert.
+        if (sqrtPrice > type(uint128).max) return type(uint128).max;
+        uint256 priceScaled = ((sqrtPrice * sqrtPrice) / (1 << 96) * 1e18) / (1 << 96);
+        return priceScaled > type(uint128).max ? type(uint128).max : uint128(priceScaled);
+    }
+
     /// @notice Align a tick to the nearest multiple of tickSpacing (round down)
     function _alignTick(int24 tick, int24 tickSpacing) internal pure returns (int24) {
         int24 compressed = tick / tickSpacing;
@@ -943,11 +1066,23 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         return compressed * tickSpacing;
     }
 
-    /// @notice Remove element at index using swap-and-pop (O(1))
-    function _removeFromArray(uint256[] storage arr, uint256 index) internal {
+    /// @notice O(1) removal of the order at `index` from a (pool, tick) bucket via swap-and-pop,
+    ///         keeping `orderBucketIndex` consistent so cancel/forceCancel need no linear scan (M3).
+    /// @dev The last element is moved into the freed slot and its index updated; callers pass the
+    ///      index from `orderBucketIndex[orderId]` (cancel/forceCancel) or the loop index `i`
+    ///      (_processTickBucket, where arr[i] is the order being removed).
+    function _removeFromBucket(PoolId poolId, int24 tick, uint256 index) internal {
+        uint256[] storage arr = tickToOrders[poolId][tick];
         if (index >= arr.length) revert IndexOutOfBounds();
-        arr[index] = arr[arr.length - 1];
+        uint256 removedOrderId = arr[index];
+        uint256 lastIndex = arr.length - 1;
+        if (index != lastIndex) {
+            uint256 lastOrderId = arr[lastIndex];
+            arr[index] = lastOrderId;
+            orderBucketIndex[lastOrderId] = index;
+        }
         arr.pop();
+        delete orderBucketIndex[removedOrderId];
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -960,8 +1095,10 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         override
         returns (bytes4)
     {
-        lastTick[key.toId()] = tick;
-        sqrtPriceBaseline[key.toId()] = sqrtPriceX96;
+        PoolId poolId = key.toId();
+        lastTick[poolId] = tick;
+        sqrtPriceBaseline[poolId] = sqrtPriceX96;
+        _ensurePoolSentinels(poolId);
         return this.afterInitialize.selector;
     }
 
@@ -974,44 +1111,47 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    /// @notice Records LP entry price and liquidity when liquidity is added
-    /// @dev LP must pass abi.encode(realLP) as hookData; without it IL tracking is skipped (graceful degradation)
+    /// @notice No-op afterAddLiquidity callback.
+    /// @dev J1: the previous `lpPositions` telemetry (recorded from spoofable, unauthenticated
+    ///      `hookData`) was removed — it was never read for payouts, rebate sizing, eligibility, or
+    ///      access control, so it was dead attack surface. The permission flag is retained (so the
+    ///      deployed hook address stays valid) and the callback simply returns a zero delta.
     function _afterAddLiquidity(
         address,
-        PoolKey calldata key,
-        IPoolManager.ModifyLiquidityParams calldata params,
+        PoolKey calldata,
+        IPoolManager.ModifyLiquidityParams calldata,
         BalanceDelta,
         BalanceDelta,
-        bytes calldata hookData
+        bytes calldata
     ) internal override returns (bytes4, BalanceDelta) {
-        if (hookData.length >= 32) {
-            address realLP = abi.decode(hookData, (address));
-            if (realLP != address(0) && params.liquidityDelta > 0) {
-                (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(key.toId());
-                lpPositions[key.toId()][realLP] = LPPosition({
-                    sqrtPriceAtEntry: sqrtPriceX96,
-                    liquidity: uint128(uint256(params.liquidityDelta)),
-                    entryTimestamp: block.timestamp,
-                    idleAmount: 0,
-                    vaultShares: 0
-                });
-            }
-        }
         return (this.afterAddLiquidity.selector, BalanceDelta.wrap(0));
     }
 
-    /// @notice Oracle-free IL approximation using Taylor expansion of the Uniswap V2 IL formula
-    /// @dev IL ≈ (Δ√P / √P)² / 2 * liquidity. Valid for small price moves (<50%).
-    ///      For larger moves the approximation underestimates; acceptable for rebate sizing.
-    function _calculateIL(uint160 sqrtPriceEntry, uint160 sqrtPriceCurrent, uint128 liq)
+    /// @notice Oracle-free rebate-sizing HEURISTIC based on the Uniswap V2 IL curve.
+    /// @dev NOT a precise impermanent-loss figure. Returns `outputNotional * (Δ√P/√P)² / 2` —
+    ///      the V2-IL shape scaled by the order's OUTPUT NOTIONAL (a token amount) used purely as
+    ///      a sizing scalar. `outputNotional` is therefore NOT Uniswap liquidity `L` (the two are
+    ///      not dimensionally comparable, and tokens with more decimals scale it up); treat the
+    ///      result as an approximate, order-size-proportional rebate CEILING, valid only for small
+    ///      moves (<50%; it underestimates beyond).
+    ///
+    ///      SAFETY (M1 + J2): this value is consumed ONLY as the upper bound in
+    ///      `rebate = min(yieldEarned, ilAmount)` (claimOrder), and the payout is further capped at
+    ///      the vault's `redeemed` amount (RebateExceedsRedeemed guard). So however the heuristic is
+    ///      sized — and however the triggering/fill price is manipulated — the rebate can never
+    ///      exceed the user's own realized vault yield, and can never draw from other orders'
+    ///      custody or from fees. A precise on-chain IL / TWAP oracle was judged disproportionate
+    ///      precisely because the payout is yield-capped. `sqrtPriceCurrent` is the fill price
+    ///      captured BEFORE the hook's own internal swap (no self-inflicted skew).
+    function _calculateIL(uint160 sqrtPriceEntry, uint160 sqrtPriceCurrent, uint128 outputNotional)
         internal
         pure
         returns (uint256 ilAmount)
     {
-        if (sqrtPriceEntry == 0 || sqrtPriceCurrent == 0 || liq == 0) return 0;
+        if (sqrtPriceEntry == 0 || sqrtPriceCurrent == 0 || outputNotional == 0) return 0;
         uint256 sqrtR = (uint256(sqrtPriceCurrent) * 1e9) / uint256(sqrtPriceEntry);
         uint256 diff = sqrtR > 1e9 ? sqrtR - 1e9 : 1e9 - sqrtR;
-        ilAmount = (uint256(liq) * diff * diff) / (2 * 1e9 * 1e9);
+        ilAmount = (uint256(outputNotional) * diff * diff) / (2 * 1e9 * 1e9);
     }
 
     /// @notice Deposits the output of a filled limit order into the ERC-4626 yield vault
@@ -1051,13 +1191,18 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         LimitOrder storage order = orders[orderId];
         if (!order.isFilled) revert OrderNotFilled();
         if (ownerOf(orderId) != msg.sender) revert NotOrderCreator();
+        // H1: bind the claim to the order's real pool — reject a caller-supplied foreign pool
+        if (PoolId.unwrap(poolKey.toId()) != PoolId.unwrap(order.poolId)) revert PoolKeyMismatch();
 
         // Determine output
         address outputToken = order.zeroForOne ? order.token1 : order.token0;
         uint256 outputAmount = order.zeroForOne ? uint256(order.amount1) : uint256(order.amount0);
         if (outputAmount == 0) revert OrderAlreadyClaimed();
 
-        // Calculate IL using pool baseline vs fill price (liquidity proxy = outputAmount)
+        // Rebate-sizing heuristic (see _calculateIL): pool-init baseline vs fill price, scaled by
+        // the order's output notional. This is an UPPER BOUND only — the actual rebate is
+        // min(yieldEarned, ilAmount), further capped at `redeemed` — so its precision never
+        // affects solvency (M1 + J2).
         PoolId poolId = poolKey.toId();
         uint256 ilAmount = _calculateIL(
             sqrtPriceBaseline[poolId],
@@ -1080,6 +1225,23 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                 } else {
                     // Vault returned <= principal (lossy redeem): pay back exactly what we received.
                     totalOut = redeemed;
+                }
+                // M2 structural solvency: in the vault path the payout is funded ONLY by what the
+                // vault just delivered this tx, so it must never exceed `redeemed`. This makes the
+                // "rebate is self-funded" property hold BY CONSTRUCTION (not by arithmetic
+                // coincidence of the rebate formula) — a future formula change cannot silently
+                // draw from other orders' custody or from pendingFees.
+                if (totalOut > redeemed) revert RebateExceedsRedeemed();
+
+                // Un-rebated yield (whatever the vault delivered beyond output + the min(yield, IL)
+                // rebate) is protocol revenue: credit it to pendingFees so the owner can withdraw it,
+                // instead of leaving it as untracked, un-withdrawable surplus in the hook. Solvency-safe
+                // by construction: 0 <= surplus = redeemed - totalOut, fully backed by what the vault
+                // just delivered this tx, and it is accounted for by the per-currency solvency invariant.
+                uint256 surplus = redeemed - totalOut;
+                if (surplus > 0) {
+                    pendingFees[Currency.wrap(outputToken)] += surplus;
+                    emit YieldSurplusToFees(orderId, Currency.wrap(outputToken), surplus);
                 }
             } catch {
                 // Vault redeem reverted: the principal is still locked in the vault, NOT in this
