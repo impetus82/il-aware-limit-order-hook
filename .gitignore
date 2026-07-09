@@ -15,3 +15,7 @@ docs/AUDIT_PREP.md
 .env
 frontend/node_modules/
 frontend/.next/
+
+# SDK build artifacts
+sdk/node_modules/
+sdk/dist/
