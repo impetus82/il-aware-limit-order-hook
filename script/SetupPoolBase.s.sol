@@ -137,8 +137,10 @@ contract SetupPoolBase is Script {
         uint256 usdcBal = IERC20(USDC).balanceOf(deployer);
         console2.log("WETH balance:", wethBal);
         console2.log("USDC balance:", usdcBal);
-        require(wethBal >= 0.0003 ether, "SetupPoolBase: need >= 0.0003 WETH for liquidity");
-        require(usdcBal >= 6e5, "SetupPoolBase: need >= 0.6 USDC for liquidity");
+        // Thresholds sit just above the deterministic seed cost measured on a Base fork
+        // (BasePoolSetupForkTest): ~0.000231 WETH + ~0.432 USDC for LIQUIDITY_DELTA at INIT_TICK.
+        require(wethBal >= 0.00025 ether, "SetupPoolBase: need >= 0.00025 WETH for liquidity");
+        require(usdcBal >= 5e5, "SetupPoolBase: need >= 0.5 USDC for liquidity");
 
         vm.startBroadcast(pk);
 
