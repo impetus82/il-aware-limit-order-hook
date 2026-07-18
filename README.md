@@ -230,6 +230,16 @@ function forceCancelOrder(uint256 orderId) external;         // UNFILLED orders 
 > from order custody — each credited only after the matching physical `take`/`redeem`
 > (see [Security](#security--audit)).
 
+### Integrating programmatically (SDK)
+
+A typed, framework-agnostic **viem SDK** lives in [`sdk/`](sdk/) and wraps the integration footguns:
+trigger-price encoding (6-decimals direct on Base vs 30-decimals inverted on Unichain), `zeroForOne`
+direction per chain's token sort, the required `PoolKey` tuple in `claimOrder`, uint96 bounds, and
+typed readers with order-status derivation. Start with
+**[docs/INTEGRATION.md](docs/INTEGRATION.md)** — deployments table, order lifecycle, quickstart,
+raw-call reference, and event signatures. The SDK's chain config is locked to the live pools by test:
+`keccak256(abi.encode(poolKey))` must reproduce both on-chain poolIds.
+
 ---
 
 ## Security & Audit
@@ -413,7 +423,11 @@ Key scenarios covered:
 |   +-- ILAwareLimitOrderHookAaveFork.t.sol       # Real Aave (Base) fork test — RUN_FORK_TESTS=1
 |-- docs/
 |   |-- AUDIT_SCOPE.md                           # Audit scope, actors, assets at risk, accepted risks
-|   +-- THREAT_MODEL.md                          # Attack surface, security properties, attack scenarios
+|   |-- THREAT_MODEL.md                          # Attack surface, security properties, attack scenarios
+|   +-- INTEGRATION.md                           # Integrator guide: deployments, lifecycle, quickstart
+|-- sdk/                                         # Typed viem SDK (addresses, price encoding, tx builders)
+|   |-- src/                                     # abi / addresses / price / orders
+|   +-- test/                                    # 18 vitest tests (incl. poolId keccak cross-check)
 +-- frontend/                                    # Next.js 16 + wagmi v2
     +-- src/
         |-- components/
