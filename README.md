@@ -359,12 +359,19 @@ sanity checks before broadcasting. On Base `WETH < USDC`, so a WETH/USDC pool ha
 | Unichain Mainnet | ILAwareLimitOrderHook | [0x8C19f1641946c662308000bB4E2Eaf684c81d4CE](https://uniscan.xyz/address/0x8C19f1641946c662308000bB4E2Eaf684c81d4CE) |
 | Unichain Mainnet | SimulatedYieldVault | [0xceee912C708516624E9aC5581c8FCC93eA8eE79d](https://uniscan.xyz/address/0xceee912C708516624E9aC5581c8FCC93eA8eE79d) |
 | Unichain Mainnet | USDC/WETH Pool | PoolId: `0xe1d695d4c147091549aeb6f9e78521a0184a1e7e272a71c12e708c881981f6ba` |
-| Base Mainnet | ILAwareLimitOrderHook (**real Aave vault**) | [0x17fE80F8a1ba277B1acd86D1622FaFC20CD254Ce](https://basescan.org/address/0x17fe80f8a1ba277b1acd86d1622fafc20cd254ce) |
+| Base Mainnet | ILAwareLimitOrderHook (**real Aave vault**) | [0x1afeB37bdC763c1FC8CCB4E30c39BFFe139894Ce](https://basescan.org/address/0x1afeb37bdc763c1fc8ccb4e30c39bffe139894ce) |
 | Base Mainnet | waBasUSDC vault (Aave USDC Static aToken, ERC-4626) | [0xC768c589647798a6EE01A91FdE98EF2ed046DBD6](https://basescan.org/address/0xc768c589647798a6ee01a91fde98ef2ed046dbd6) |
+| Base Mainnet | WETH/USDC Pool | PoolId: `0x8d27ee1ba3ae15df876ab2929cc21e23109ba2e3f181222eb795466956727c08` |
 
 Unichain pool init tx: [0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a4](https://uniscan.xyz/tx/0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a4)
 
-Base deploy tx: [0x4727848c37df27a92f7634ddab497900609a7a912f6a5fecac98566bbd2176d3](https://basescan.org/tx/0x4727848c37df27a92f7634ddab497900609a7a912f6a5fecac98566bbd2176d3) — verified, funded by **real Aave USDC yield**. Base pool init (WETH/USDC, `currency0 = WETH`) is the next step.
+Base deploy tx: [0x95143d9220b6d1773f40afb424693d3fbb90858a4337292e5c6246c0a822c1d0](https://basescan.org/tx/0x95143d9220b6d1773f40afb424693d3fbb90858a4337292e5c6246c0a822c1d0) — verified, funded by **real Aave USDC yield**; the WETH/USDC pool (`currency0 = WETH`) is live and seeded. This is the hardened redeploy (saturating IL math, measured-receipt claim); it supersedes `0x17fE80…254Ce`, which never received an order.
+
+> **Operational note.** The Base pool's seed liquidity is held by the `LiquidityRouterBase` deployed at
+> [`0x875a7c0277c655278C0a53138Ee2C33698016CaF`](https://basescan.org/address/0x875a7c0277c655278c0a53138ee2c33698016caf)
+> (owner = deployer). Deepen the pool with another `addLiquidity`, or withdraw the seed with
+> `removeLiquidity(poolKey, deployed())` — the v4 position belongs to that router, so this address is
+> the only way to reach it.
 
 ---
 

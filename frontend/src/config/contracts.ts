@@ -53,9 +53,10 @@ type ChainContracts = {
 const CHAIN_CONTRACTS: Record<number, ChainContracts> = {
   // ── Base Mainnet (8453) ─────────────────────────────
   8453: {
-    // DeployBaseAave — production hook wired to REAL Aave (waBasUSDC). Supersedes the old demo
-    // hook 0x45d971BdE51dd5E109036aB70a4E0b0eD2Dc4040 (SimulatedYieldVault).
-    hook: "0x17fE80F8a1ba277B1acd86D1622FaFC20CD254Ce",
+    // DeployBaseAave — production hook wired to REAL Aave (waBasUSDC). Redeployed 2026-07-25 with
+    // the vault-path hardening (saturating _calculateIL, measured-receipt claim, ZeroSharesMinted);
+    // supersedes 0x17fE80…254Ce, and before that the demo hook 0x45d9…4040 (SimulatedYieldVault).
+    hook: "0x1afeB37bdC763c1FC8CCB4E30c39BFFe139894Ce",
     stateView: "0xa3c0c9b65bad0b08107aa264b0f3db444b867a71",
     poolManager: "0x498581fF718922c3f8e6A244956aF099B2652b2b",
     weth: {
@@ -70,7 +71,7 @@ const CHAIN_CONTRACTS: Record<number, ChainContracts> = {
       name: "USD Coin",
       decimals: 6,
     },
-    poolId: "0x2635acf3c8c698bea9a28853457930c14d6eceec348de6b87e1892e88e4b81f2",
+    poolId: "0x8d27ee1ba3ae15df876ab2929cc21e23109ba2e3f181222eb795466956727c08",
     explorerUrl: "https://basescan.org",
     chainLabel: "BASE",
     wethIsCurrency0: true,
