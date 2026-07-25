@@ -128,6 +128,9 @@ contract SetupPoolBase is Script {
     function run() external {
         uint256 pk = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(pk);
+        // Overridable so a freshly redeployed hook can be wired up without editing the constant
+        // (mirrors POOL_MANAGER / YIELD_VAULT above).
+        address hook = vm.envOr("HOOK", HOOK);
 
         // Base: currency0 = WETH, currency1 = USDC (WETH sorts first).
         PoolKey memory poolKey = PoolKey({
@@ -135,20 +138,20 @@ contract SetupPoolBase is Script {
             currency1: Currency.wrap(USDC),
             fee: POOL_FEE,
             tickSpacing: TICK_SPACING,
-            hooks: IHooks(HOOK)
+            hooks: IHooks(hook)
         });
         PoolId id = poolKey.toId();
         uint160 initSqrtPrice = TickMath.getSqrtPriceAtTick(INIT_TICK);
 
         console2.log("=== SetupPoolBase - WETH/USDC pool for the real-Aave hook ===");
         console2.log("Deployer:", deployer);
-        console2.log("Hook:    ", HOOK);
+        console2.log("Hook:    ", hook);
         console2.log("currency0 (WETH):", WETH);
         console2.log("currency1 (USDC):", USDC);
         console2.log("Init tick:", INIT_TICK);
 
         // ── Pre-flight sanity (view calls, run during simulation) ──
-        require(HOOK.code.length > 0, "SetupPoolBase: hook not deployed (wrong chain?)");
+        require(hook.code.length > 0, "SetupPoolBase: hook not deployed (wrong chain?)");
         require(WETH < USDC, "SetupPoolBase: token sort broken (currency0 must be WETH on Base)");
 
         uint256 wethBal = IERC20(WETH).balanceOf(deployer);
