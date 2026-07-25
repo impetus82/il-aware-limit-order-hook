@@ -298,7 +298,8 @@ affected user's own funds**; all are candidate items for the auditor to independ
   `currency1`** (18 decimals) — the opposite of the Base deployment. This is the decimals footgun
   referenced in §5/§9.
 - **Base mainnet (chainId 8453) — production, real Aave vault:** hook
-  `0x17fE80F8a1ba277B1acd86D1622FaFC20CD254Ce` (verified) wires `yieldVault` to the REAL Aave USDC Static
+  `0x1afeB37bdC763c1FC8CCB4E30c39BFFe139894Ce` (verified; pool
+  `0x8d27ee1ba3ae15df876ab2929cc21e23109ba2e3f181222eb795466956727c08`) wires `yieldVault` to the REAL Aave USDC Static
   aToken `waBasUSDC` `0xC768c589647798a6EE01A91FdE98EF2ed046DBD6` (ERC-4626, `asset() == USDC`), so the
   yield rebate is funded by real Aave lending, not the demo vault. On Base **WETH is `currency0`** (opposite
   Unichain), so only USDC-output orders route into the vault. The hook bytecode is identical across chains
