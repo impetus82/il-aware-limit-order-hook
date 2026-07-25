@@ -123,6 +123,15 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice Thrown if a vault-path claim payout would exceed what the vault just redeemed (M2 solvency)
     error RebateExceedsRedeemed();
 
+    /// @notice Thrown if an ERC-4626 deposit consumed the order's output but credited zero shares.
+    /// @dev    Deliberately raised INSIDE the try-block's success branch so it propagates and reverts
+    ///         the whole call: the assets have already left the hook, so recording a zero share claim
+    ///         would silently drop the order onto the non-vault payout path and settle it from other
+    ///         orders' custody. Reachable with a CONFORMANT vault (deposit rounds shares down, and
+    ///         OZ's ERC4626 does not revert at zero) whenever the output is dust relative to the
+    ///         share price — reverting leaves the output untouched and claimable as normal.
+    error ZeroSharesMinted();
+
     /*//////////////////////////////////////////////////////////////
                             DATA STRUCTURES
     //////////////////////////////////////////////////////////////*/
@@ -319,6 +328,21 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     ///         owner can re-claim once the vault recovers. No tokens are paid from the hook's
     ///         balance on this path, which keeps every other order's custodied output solvent.
     event VaultRedeemFailed(uint256 indexed orderId, uint256 shares);
+
+    /// @notice Emitted when a filled order's output is successfully deposited into the yield vault.
+    /// @param orderId The order whose output was deposited
+    /// @param assets The output amount handed to the vault
+    /// @param shares The vault shares credited to this order
+    event VaultDeposited(uint256 indexed orderId, uint256 assets, uint256 shares);
+
+    /// @notice Emitted when an ERC-4626 vault deposit reverts during depositToVault.
+    /// @dev    The order is left untouched (output stays in hook custody, still claimable via the
+    ///         non-vault path) and the approval is reset to zero. The raw revert data is surfaced so
+    ///         integrators can tell a capped/paused vault apart from a hostile one.
+    /// @param orderId The order whose deposit was skipped
+    /// @param assets The output amount that was offered to the vault
+    /// @param reason Raw revert data returned by the vault
+    event VaultDepositFailed(uint256 indexed orderId, uint256 assets, bytes reason);
 
     /*//////////////////////////////////////////////////////////////
                            CONSTRUCTOR
@@ -1151,6 +1175,19 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         if (sqrtPriceEntry == 0 || sqrtPriceCurrent == 0 || outputNotional == 0) return 0;
         uint256 sqrtR = (uint256(sqrtPriceCurrent) * 1e9) / uint256(sqrtPriceEntry);
         uint256 diff = sqrtR > 1e9 ? sqrtR - 1e9 : 1e9 - sqrtR;
+        if (diff == 0) return 0;
+        // SATURATING (mirrors `_saturatingPrice` on the swap path). `outputNotional * diff * diff`
+        // forms the full product before dividing, so a baseline far BELOW the fill price overflows:
+        // with `sqrtPriceBaseline` at MIN_SQRT_PRICE and a fill at 1:1, `diff^2 ~ 3.4e56` and any
+        // output above ~3.4e20 panics (0x11). claimOrder calls this UNCONDITIONALLY — before the
+        // vault branch, and even when no vault is attached — and it is the only exit for a filled
+        // order (forceCancelOrder refuses filled orders; there is no sweep), so a revert here would
+        // permanently lock that order's output. Saturating is semantically free because the result is
+        // consumed ONLY as the upper bound in `rebate = min(yieldEarned, ilAmount)`: an enormous
+        // ilAmount simply lets the yield cap bind instead, and the payout stays bounded by `redeemed`
+        // (RebateExceedsRedeemed). The guard divides twice rather than forming `diff * diff`, which
+        // would itself overflow at extreme baselines.
+        if (uint256(outputNotional) > type(uint256).max / diff / diff) return type(uint256).max;
         ilAmount = (uint256(outputNotional) * diff * diff) / (2 * 1e9 * 1e9);
     }
 
@@ -1171,9 +1208,19 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
 
         IERC20(outputToken).forceApprove(yieldVault, amount);
         try IERC4626(yieldVault).deposit(amount, address(this)) returns (uint256 shares) {
+            // Assets have left the hook at this point. A zero share credit would strand them: the
+            // order would fall back to the non-vault payout path and be settled from other orders'
+            // custody. Revert instead (propagates out of the try-block) so the deposit is a no-op.
+            if (shares == 0) revert ZeroSharesMinted();
             order.vaultShares = shares;
-        } catch {
+            // A conformant vault pulls exactly `amount`, but the vault is only semi-trusted: one that
+            // pulls less would otherwise leave a standing allowance over this hook's balance of the
+            // output token — which also backs other orders' custody and pendingFees.
             IERC20(outputToken).forceApprove(yieldVault, 0);
+            emit VaultDeposited(orderId, amount, shares);
+        } catch (bytes memory reason) {
+            IERC20(outputToken).forceApprove(yieldVault, 0);
+            emit VaultDepositFailed(orderId, amount, reason);
         }
     }
 
@@ -1215,8 +1262,19 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
 
         if (order.vaultShares > 0 && yieldVault != address(0)) {
             uint256 shares = order.vaultShares;
-            try IERC4626(yieldVault).redeem(shares, address(this), address(this)) returns (uint256 redeemed) {
-                // Vault paid `redeemed` assets into this hook; settling from that is solvency-safe.
+            // Snapshot before the call so the payout can be priced from a MEASURED receipt rather
+            // than from the vault's self-reported return value (the vault is only semi-trusted).
+            uint256 balanceBefore = IERC20(outputToken).balanceOf(address(this));
+            try IERC4626(yieldVault).redeem(shares, address(this), address(this)) returns (uint256 reported) {
+                // Settle from `min(reported, actually received)`. For a conformant ERC-4626 the two
+                // are equal, so behaviour is unchanged; for a vault that over-reports (or an output
+                // token that charges a transfer fee) the payout, the RebateExceedsRedeemed guard and
+                // the surplus->pendingFees credit all bind against tokens the hook PHYSICALLY holds.
+                // This is what makes "the rebate is self-funded" true by construction rather than by
+                // assumption. Reading the balance delta is safe here (unlike a pro-rata denominator):
+                // an outside donation can only inflate `received`, and `min` then picks `reported`.
+                uint256 received = IERC20(outputToken).balanceOf(address(this)) - balanceBefore;
+                uint256 redeemed = reported < received ? reported : received;
                 order.vaultShares = 0;
                 if (redeemed > outputAmount) {
                     uint256 yieldEarned = redeemed - outputAmount;

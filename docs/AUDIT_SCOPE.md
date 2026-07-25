@@ -124,12 +124,18 @@ auditors should note the usual "owner key compromise" surface is limited to the 
   `poolManager.swap` inside the `afterSwap` unlock; `sync`/`settle`/`take` are used for settlement. The
   hook assumes standard V4 semantics (slot0, delta signs, unlock/lock).
 - **ERC-4626 vault (`yieldVault`, immutable):** **trusted-ish.** `deposit` is wrapped in
-  `try/catch` (deposit failure is a no-op that resets approval). `redeem` is wrapped in `try/catch`
-  (redeem failure leaves the position fully intact for re-claim, emitting `VaultRedeemFailed`; **no**
-  hook balance is paid on that path). The hook assumes the vault does **not** re-enter (it is called
-  from `nonReentrant` functions) and that `redeem` returns the assets it transfers. A malicious vault can
-  at worst grief its own depositors (deposit/redeem DoS) or return a lossy redeem (handled: user is paid
-  exactly `redeemed`); it **cannot** reach other orders' custody (the `RebateExceedsRedeemed` guard, M2).
+  `try/catch` (deposit failure is a no-op that resets approval and emits `VaultDepositFailed` with the
+  raw revert data). `redeem` is wrapped in `try/catch` (redeem failure leaves the position fully intact
+  for re-claim, emitting `VaultRedeemFailed`; **no** hook balance is paid on that path). The hook assumes
+  the vault does **not** re-enter (it is called from `nonReentrant` functions). It does **not** assume the
+  vault reports honestly: the claim payout is priced from `min(reported, measured balance delta)`, so an
+  over-reporting vault (or a fee-on-transfer output token) cannot inflate the payout beyond what the hook
+  physically received. Likewise `depositToVault` rejects a deposit that consumed assets but credited zero
+  shares (`ZeroSharesMinted`) and zeroes the approval on **both** the success and failure paths, so no
+  standing allowance survives over the hook's shared balance. A malicious vault can therefore at worst
+  grief its own depositors (deposit/redeem DoS) or return a lossy redeem (handled: user is paid exactly
+  what arrived); it **cannot** reach other orders' custody — enforced, not merely assumed, by the measured
+  receipt plus the `RebateExceedsRedeemed` guard (M2).
 - **ERC-20 tokens:** `SafeERC20` used throughout; `ReentrancyGuard` on all token-custody entry points
   (ERC-777 defense). **Decimal assumption:** the IL-rebate math and the `1e18`-scaled price helpers
   (`sqrtPriceToUint128`, `uint128ToSqrtPrice`, `_calculateIL`) implicitly assume ~18-decimal semantics
@@ -253,6 +259,26 @@ affected user's own funds**; all are candidate items for the auditor to independ
 6. **M4 overflow clamp is dead code post-L1.** `_tolerantSqrtLimit`'s `priceX192 > type(uint256).max >> 96`
    overflow clamp can no longer be reached by any creatable order, because L1's `MAX_TRIGGER_PRICE = 1e36`
    sits ~18× below the clamp threshold (~1.83e37). It is retained as defense-in-depth.
+
+7. **`sqrtPriceBaseline` is attacker-settable at pool creation (bounded, `_calculateIL` now saturating).**
+   The baseline is stamped once in `_afterInitialize`, i.e. at the only moment a pool is provably empty,
+   and pool initialization is permissionless on a deterministic `PoolKey` — so a third party (or a
+   front-runner of the deployer's own setup script) can fix any pool's baseline at an arbitrary price,
+   permanently (no setter; v4 rejects re-initialize). **Value impact is bounded and was already covered:**
+   the baseline only feeds `ilAmount`, which is consumed solely as the ceiling in
+   `rebate = min(yieldEarned, ilAmount)` and capped again at what the vault delivered — so a poisoned
+   baseline can at most let an order owner keep 100% of their *own* vault yield instead of the
+   `min(yield, IL)` share, diverting protocol revenue that would otherwise reach `pendingFees`. It can
+   never make the hook overpay. **Availability impact is now fixed:** a baseline far *below* the fill
+   price used to overflow `outputNotional * diff * diff` and panic (`0x11`) inside `_calculateIL`, which
+   `claimOrder` calls unconditionally — permanently stranding every filled order in that pool, since
+   `claimOrder` is their only exit (`forceCancelOrder` refuses filled orders and there is no sweep).
+   `_calculateIL` is now **saturating** (returning `type(uint256).max` instead of reverting), mirroring
+   the `_saturatingPrice` treatment already applied on the swap path; saturation is semantically free
+   because the value is a ceiling only. Proven end-to-end by
+   `test_M06_PoisonedBaselinePoolStillClaimable` (mutation-verified: panics `0x11` without the guard).
+   Neither live deployment is affected — both pools were initialized at sane prices, and a sanely
+   initialized pool is immune.
 
 ---
 
