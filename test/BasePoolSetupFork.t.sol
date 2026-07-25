@@ -13,7 +13,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {LiquidityRouterBase} from "../script/SetupPoolBase.s.sol";
 
 /// @notice Fork Base mainnet and validate `SetupPoolBase`'s init + add-liquidity logic against the REAL
-///         deployed hook (`0x17fE80…`), the REAL Base PoolManager, and REAL WETH/USDC — using the exact
+///         deployed hook (`0x1afeB37…`), the REAL Base PoolManager, and REAL WETH/USDC — using the exact
 ///         `LiquidityRouterBase` the script broadcasts. Opt-in (RUN_FORK_TESTS=1) so the default offline
 ///         suite is untouched.
 ///
@@ -26,7 +26,7 @@ contract BasePoolSetupForkTest is Test {
     IPoolManager constant POOL_MANAGER = IPoolManager(0x498581fF718922c3f8e6A244956aF099B2652b2b);
     address constant WETH = 0x4200000000000000000000000000000000000006;
     address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
-    address constant HOOK = 0x17fE80F8a1ba277B1acd86D1622FaFC20CD254Ce; // DeployBaseAave, real Aave vault
+    address constant HOOK = 0x1afeB37bdC763c1FC8CCB4E30c39BFFe139894Ce; // DeployBaseAave (hardened redeploy)
     uint24 constant POOL_FEE = 3000;
     int24 constant TICK_SPACING = 60;
     int24 constant INIT_TICK = -201000; // ~1866 USDC/WETH (currency0 = WETH on Base)

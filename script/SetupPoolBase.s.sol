@@ -112,7 +112,10 @@ contract SetupPoolBase is Script {
     IPoolManager constant POOL_MANAGER = IPoolManager(0x498581fF718922c3f8e6A244956aF099B2652b2b);
     address constant WETH = 0x4200000000000000000000000000000000000006;
     address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
-    address constant HOOK = 0x17fE80F8a1ba277B1acd86D1622FaFC20CD254Ce; // DeployBaseAave, real Aave vault
+    /// @dev DeployBaseAave, real Aave vault. Redeployed 2026-07-25 with the vault-path hardening
+    ///      (saturating `_calculateIL`, measured-receipt claim, ZeroSharesMinted). Supersedes
+    ///      0x17fE80F8a1ba277B1acd86D1622FaFC20CD254Ce, whose pool is now abandoned.
+    address constant HOOK = 0x1afeB37bdC763c1FC8CCB4E30c39BFFe139894Ce;
 
     // Must match the frontend pool params (contracts.ts POOL_FEE / TICK_SPACING).
     uint24 constant POOL_FEE = 3000; // 0.30%
