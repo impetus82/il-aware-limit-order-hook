@@ -27,6 +27,12 @@ contract LiquidityRouterBase is IUnlockCallback {
     int24 constant TICK_LOWER = -887220;
     int24 constant TICK_UPPER = 887220;
 
+    /// @notice Liquidity this router currently holds in the position.
+    /// @dev    The v4 position is owned by THIS contract, so without a withdraw path the seed would be
+    ///         permanently locked — which is exactly what happened to the first Base seed. Tracked here
+    ///         so `removeLiquidity` can never try to burn more than the router actually deployed.
+    uint256 public deployed;
+
     constructor(IPoolManager _poolManager, int256 _liquidityDelta) {
         poolManager = _poolManager;
         owner = msg.sender;
@@ -35,17 +41,28 @@ contract LiquidityRouterBase is IUnlockCallback {
 
     function addLiquidity(PoolKey calldata poolKey) external {
         require(msg.sender == owner, "Only owner");
-        poolManager.unlock(abi.encode(poolKey, msg.sender));
+        require(liquidityDelta > 0, "delta must be positive");
+        poolManager.unlock(abi.encode(poolKey, msg.sender, liquidityDelta));
+        deployed += uint256(liquidityDelta);
+    }
+
+    /// @notice Withdraw seeded liquidity (plus any accrued fees) back to the owner.
+    /// @param amount Liquidity units to burn; pass `deployed()` to exit fully.
+    function removeLiquidity(PoolKey calldata poolKey, uint256 amount) external {
+        require(msg.sender == owner, "Only owner");
+        require(amount > 0 && amount <= deployed, "bad amount");
+        deployed -= amount;
+        poolManager.unlock(abi.encode(poolKey, msg.sender, -int256(amount)));
     }
 
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
         require(msg.sender == address(poolManager), "Only PoolManager");
-        (PoolKey memory poolKey, address payer) = abi.decode(data, (PoolKey, address));
+        (PoolKey memory poolKey, address payer, int256 delta_) = abi.decode(data, (PoolKey, address, int256));
 
         (BalanceDelta delta,) = poolManager.modifyLiquidity(
             poolKey,
             IPoolManager.ModifyLiquidityParams({
-                tickLower: TICK_LOWER, tickUpper: TICK_UPPER, liquidityDelta: liquidityDelta, salt: bytes32(0)
+                tickLower: TICK_LOWER, tickUpper: TICK_UPPER, liquidityDelta: delta_, salt: bytes32(0)
             }),
             ""
         );
@@ -67,7 +84,8 @@ contract LiquidityRouterBase is IUnlockCallback {
             );
             poolManager.settle();
         }
-        // Positive delta shouldn't occur on add-liquidity, but return it to payer if it does.
+        // Positive delta = the pool owes us: on removeLiquidity this is the returned principal plus any
+        // accrued fees; on addLiquidity it should not occur, but is forwarded to the payer either way.
         if (delta.amount0() > 0) poolManager.take(poolKey.currency0, payer, uint256(uint128(delta.amount0())));
         if (delta.amount1() > 0) poolManager.take(poolKey.currency1, payer, uint256(uint128(delta.amount1())));
         return "";

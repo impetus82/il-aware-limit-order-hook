@@ -100,5 +100,24 @@ contract BasePoolSetupForkTest is Test {
         console2.log("WETH spent:", wethSpent);
         console2.log("USDC spent:", usdcSpent);
         console2.log("Active liquidity:", POOL_MANAGER.getLiquidity(id));
+
+        // 4) The seed must be RECOVERABLE. The v4 position is owned by the router, so without a
+        //    withdraw path the seed is locked forever — which is what happened to the first Base
+        //    deployment (its ~$0.86 seed is stranded in a router that only had addLiquidity).
+        uint256 wethMid = IERC20(WETH).balanceOf(address(this));
+        uint256 usdcMid = IERC20(USDC).balanceOf(address(this));
+        uint256 liqMid = POOL_MANAGER.getLiquidity(id);
+        router.removeLiquidity(poolKey, router.deployed());
+
+        assertEq(router.deployed(), 0, "router should hold no liquidity after a full exit");
+        assertGt(IERC20(WETH).balanceOf(address(this)) - wethMid, 0, "WETH returned to owner");
+        assertGt(IERC20(USDC).balanceOf(address(this)) - usdcMid, 0, "USDC returned to owner");
+        // Compare the DELTA, not an absolute: the live pool already carries the first deployment's
+        // stranded seed, which this router cannot (and must not) touch.
+        assertEq(
+            liqMid - POOL_MANAGER.getLiquidity(id),
+            uint256(LIQUIDITY_DELTA),
+            "exactly this router's own seed must leave the pool"
+        );
     }
 }
