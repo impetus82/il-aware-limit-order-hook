@@ -125,8 +125,11 @@ contract SetupPoolBase is Script {
     // tick -201000 ≈ 1866 USDC/WETH (mirror-image of Unichain's +201002 where USDC is currency0).
     int24 constant INIT_TICK = -201000;
 
-    // Micro full-range liquidity (~0.0003 WETH + ~0.5 USDC). Enough to be tradeable; add more later.
-    int256 constant LIQUIDITY_DELTA = 1e10;
+    /// @dev Micro full-range seed, sized to what the deployer already holds (~0.000033 WETH +
+    ///      ~0.061 USDC at the init tick). Enough to make the pool tradeable and let orders fill;
+    ///      the pool can be deepened later by calling `addLiquidity` again on the same router, and
+    ///      the whole seed is recoverable via `removeLiquidity`.
+    int256 constant LIQUIDITY_DELTA = 1.4e9;
 
     function run() external {
         uint256 pk = vm.envUint("DEPLOYER_PRIVATE_KEY");
@@ -162,9 +165,9 @@ contract SetupPoolBase is Script {
         console2.log("WETH balance:", wethBal);
         console2.log("USDC balance:", usdcBal);
         // Thresholds sit just above the deterministic seed cost measured on a Base fork
-        // (BasePoolSetupForkTest): ~0.000231 WETH + ~0.432 USDC for LIQUIDITY_DELTA at INIT_TICK.
-        require(wethBal >= 0.00025 ether, "SetupPoolBase: need >= 0.00025 WETH for liquidity");
-        require(usdcBal >= 5e5, "SetupPoolBase: need >= 0.5 USDC for liquidity");
+        // (BasePoolSetupForkTest) for LIQUIDITY_DELTA at INIT_TICK. Re-measure if either changes.
+        require(wethBal >= 0.000035 ether, "SetupPoolBase: need >= 0.000035 WETH for liquidity");
+        require(usdcBal >= 65_000, "SetupPoolBase: need >= 0.065 USDC for liquidity");
 
         vm.startBroadcast(pk);
 
