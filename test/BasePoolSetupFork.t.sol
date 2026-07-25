@@ -30,7 +30,7 @@ contract BasePoolSetupForkTest is Test {
     uint24 constant POOL_FEE = 3000;
     int24 constant TICK_SPACING = 60;
     int24 constant INIT_TICK = -201000; // ~1866 USDC/WETH (currency0 = WETH on Base)
-    int256 constant LIQUIDITY_DELTA = 1e10;
+    int256 constant LIQUIDITY_DELTA = 1.4e9; // keep in sync with SetupPoolBase.s.sol
 
     function setUp() public {
         if (vm.envOr("RUN_FORK_TESTS", uint256(0)) == 0) {
