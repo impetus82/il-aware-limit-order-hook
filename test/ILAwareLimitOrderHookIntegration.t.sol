@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Test, console2} from "forge-std/Test.sol";
+import {Test, console2, Vm} from "forge-std/Test.sol";
 import {ILAwareLimitOrderHook} from "../src/ILAwareLimitOrderHook.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {PoolManager} from "v4-core/src/PoolManager.sol";
@@ -95,9 +95,23 @@ contract MockERC4626 {
     uint256 public yieldBps; // extra yield in BPS (0 = no yield)
     uint256 public lossBps; // shortfall in BPS (0 = no loss); redeem returns shares - loss
     bool public shouldRevert;
+    /// @dev Consume the assets but credit ZERO shares. A conformant ERC-4626 does this whenever
+    ///      `assets` rounds down to no shares (OZ's implementation does not revert at zero).
+    bool public mintZeroShares;
+    /// @dev Fraction of the offered assets actually pulled on deposit (10000 = all, the default).
+    ///      A vault pulling less would leave a standing allowance if the hook did not reset it.
+    uint256 public pullBps = 10_000;
 
     constructor(address _asset) {
         asset = IERC20(_asset);
+    }
+
+    function setMintZeroShares(bool _mintZeroShares) external {
+        mintZeroShares = _mintZeroShares;
+    }
+
+    function setPullBps(uint256 _pullBps) external {
+        pullBps = _pullBps;
     }
 
     function setYieldBps(uint256 _yieldBps) external {
@@ -114,8 +128,9 @@ contract MockERC4626 {
 
     function deposit(uint256 assets, address receiver) external returns (uint256 shares) {
         if (shouldRevert) revert("vault: revert");
-        asset.transferFrom(msg.sender, address(this), assets);
-        shares = assets; // 1:1
+        uint256 pulled = assets * pullBps / 10_000;
+        asset.transferFrom(msg.sender, address(this), pulled);
+        shares = mintZeroShares ? 0 : pulled; // 1:1 unless the zero-share edge is being exercised
         sharesOf[receiver] += shares;
         totalShares += shares;
     }
@@ -1636,6 +1651,253 @@ contract ILAwareLimitOrderHookIntegrationTest is Test {
         );
         assertEq(hookWithVault.getPendingFees(out), 0, "pendingFees must be zeroed after withdrawal");
         console2.log("Yield surplus captured to pendingFees:", surplus);
+    }
+
+    /// @notice M-06 analogue: a pool whose baseline was stamped at an attacker-chosen bottom price
+    ///         must not permanently lock its filled orders.
+    /// @dev    `sqrtPriceBaseline` is written once in `_afterInitialize`, at the one moment the pool is
+    ///         provably empty, and pool initialization is permissionless on a deterministic PoolKey —
+    ///         so anyone can front-run and fix the baseline at MIN_SQRT_PRICE forever (no setter, v4
+    ///         rejects re-initialize). `claimOrder` then calls `_calculateIL` UNCONDITIONALLY — before
+    ///         the vault branch and even with no vault attached — and the pre-fix expression
+    ///         `outputNotional * diff * diff` panics (0x11) once `diff^2 ~ 3.4e56` meets an output
+    ///         above ~3.4e20. Since `claimOrder` is the only exit for a filled order
+    ///         (`forceCancelOrder` refuses filled orders, there is no sweep), that revert would strand
+    ///         the output permanently. The saturating guard keeps the claim payable.
+    ///         Uses the default no-vault hook, which is the point: the defect is vault-independent.
+    function test_M06_PoisonedBaselinePoolStillClaimable() public {
+        // 1) Attacker-style init: stamp the baseline at the very bottom of the price range.
+        PoolKey memory poisoned = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 500,
+            tickSpacing: 60,
+            hooks: hook
+        });
+        manager.initialize(poisoned, TickMath.MIN_SQRT_PRICE + 1);
+
+        // 2) Real liquidity sits around parity; the empty ticks in between cost nothing to cross.
+        token0.mint(address(this), 2e23);
+        token1.mint(address(this), 2e23);
+        modifyLiquidityRouter.modifyLiquidity(
+            poisoned,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -6000, tickUpper: 6000, liquidityDelta: 1e23, salt: bytes32(0)
+            }),
+            ""
+        );
+
+        // 3) Ordinary trading drags spot from the bottom up into the liquidity band. This settles
+        //    first, so the PoolManager actually custodies token1 by the time an order needs paying.
+        token1.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            poisoned,
+            IPoolManager.SwapParams({
+                zeroForOne: false,
+                amountSpecified: -5e22,
+                sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(0)
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        // 4) A victim rests a normal SELL order; the pool now looks entirely healthy to them — spot is
+        //    at parity and nothing surfaces the poisoned baseline.
+        token0.mint(alice, 1_000e18);
+        vm.startPrank(alice);
+        token0.approve(address(hook), type(uint256).max);
+        uint256 orderId = hook.createLimitOrder(poisoned, true, 600e18, 0.9e18);
+        vm.stopPrank();
+
+        // The next ordinary swap fills it, at a price ~1e19x above the poisoned baseline.
+        swapRouter.swap(
+            poisoned,
+            IPoolManager.SwapParams({
+                zeroForOne: false,
+                amountSpecified: -1e18,
+                sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(600)
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        ILAwareLimitOrderHook.LimitOrder memory ord = hook.getOrder(orderId);
+        assertTrue(ord.isFilled, "setup: victim's order must fill");
+        // Output must clear the ~3.4e20 overflow threshold for this baseline, or the test proves nothing.
+        assertGt(uint256(ord.amount1), 3.5e20, "setup: output must be past the overflow threshold");
+
+        // 5) The claim must go through: the output is paid in full, not stranded.
+        uint256 before = token1.balanceOf(alice);
+        vm.prank(alice);
+        hook.claimOrder(orderId, poisoned);
+        assertEq(token1.balanceOf(alice) - before, uint256(ord.amount1), "output must be recoverable");
+        vm.expectRevert(); // NFT burned => position closed
+        hook.ownerOf(orderId);
+    }
+
+    /// @dev Deploys a hook wired to `vault`, initializes its pool, then creates and fills a BUY order
+    ///      for alice — leaving a FILLED, not-yet-deposited order whose output currency is token0
+    ///      (the vault's asset). Mirrors the setup the other vault tests do inline.
+    function _vaultOrderFixture(MockERC4626 vault)
+        internal
+        returns (ILAwareLimitOrderHook hookWithVault, PoolKey memory vaultPoolKey, uint256 orderId)
+    {
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory args = abi.encode(address(manager), address(this), address(vault));
+        vm.pauseGasMetering();
+        (address predicted, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(ILAwareLimitOrderHook).creationCode, args);
+        hookWithVault =
+            new ILAwareLimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this), address(vault));
+        require(address(hookWithVault) == predicted, "fixture: hook address mismatch");
+        vm.resumeGasMetering();
+
+        vaultPoolKey = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 100,
+            tickSpacing: 1,
+            hooks: hookWithVault
+        });
+        manager.initialize(vaultPoolKey, TickMath.getSqrtPriceAtTick(0));
+
+        token0.mint(address(this), 5_000e18);
+        token1.mint(address(this), 5_000e18);
+        modifyLiquidityRouter.modifyLiquidity(
+            vaultPoolKey,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -600, tickUpper: 600, liquidityDelta: 5_000e18, salt: bytes32(0)
+            }),
+            ""
+        );
+
+        token1.mint(alice, 10e18);
+        vm.startPrank(alice);
+        token1.approve(address(hookWithVault), type(uint256).max);
+        token0.approve(address(hookWithVault), type(uint256).max);
+        orderId = hookWithVault.createLimitOrder(vaultPoolKey, false, 1e18, 1.002e18);
+        vm.stopPrank();
+
+        token0.mint(address(this), 50e18);
+        token0.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            vaultPoolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, amountSpecified: -50e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertTrue(hookWithVault.getOrder(orderId).isFilled, "fixture: order must be filled");
+    }
+
+    /// @notice Vault-deposit hardening: a vault that consumes the assets but credits ZERO shares must
+    ///         revert the deposit, not silently strand the output.
+    /// @dev    Without the `shares == 0` guard the order would keep `vaultShares == 0`, fall back to
+    ///         the non-vault payout path on claim, and be settled out of OTHER orders' custody — the
+    ///         assets having already left the hook. Reachable with a CONFORMANT vault (ERC-4626
+    ///         rounds shares down and OZ's implementation does not revert at zero) whenever the
+    ///         output is dust relative to the share price, which is unbounded here because the hook
+    ///         deliberately enforces no MIN_ORDER_SIZE. Reverting keeps the deposit a clean no-op.
+    function test_VaultFix_ZeroShareDepositReverts_AndOutputStaysClaimable() public {
+        MockERC4626 vault = new MockERC4626(address(token0));
+        vault.setMintZeroShares(true);
+        (ILAwareLimitOrderHook hookWithVault, PoolKey memory vaultPoolKey, uint256 orderId) =
+            _vaultOrderFixture(vault);
+
+        uint256 hookBefore = token0.balanceOf(address(hookWithVault));
+        uint256 outputAmount = hookWithVault.getOrder(orderId).amount0;
+        assertGt(outputAmount, 0, "order should hold token0 output");
+
+        vm.prank(alice);
+        vm.expectRevert(ILAwareLimitOrderHook.ZeroSharesMinted.selector);
+        hookWithVault.depositToVault(orderId);
+
+        // The revert rolled everything back: no shares recorded, output still custodied by the hook,
+        // and no allowance left dangling toward the vault.
+        assertEq(hookWithVault.getOrder(orderId).vaultShares, 0, "no shares recorded");
+        assertEq(token0.balanceOf(address(hookWithVault)), hookBefore, "output must not leave the hook");
+        assertEq(token0.allowance(address(hookWithVault), address(vault)), 0, "no standing allowance");
+
+        // And the position is untouched: the owner can still claim it via the plain (non-vault) path.
+        uint256 aliceBefore = token0.balanceOf(alice);
+        vm.prank(alice);
+        hookWithVault.claimOrder(orderId, vaultPoolKey);
+        assertEq(token0.balanceOf(alice) - aliceBefore, outputAmount, "claim pays the full output");
+    }
+
+    /// @notice Vault-deposit hardening: no standing allowance survives a SUCCESSFUL deposit, even if
+    ///         the vault pulls less than it was offered.
+    /// @dev    The threat model treats the vault as semi-trusted/possibly hostile. A vault that pulls
+    ///         less than `amount` would otherwise retain an allowance over the hook's balance of the
+    ///         output token — which also backs other orders' custody and pendingFees.
+    function test_VaultFix_NoStandingAllowanceAfterDeposit() public {
+        MockERC4626 vault = new MockERC4626(address(token0));
+        vault.setPullBps(6_000); // deliberately under-pulls: 60% of what it was offered
+        (ILAwareLimitOrderHook hookWithVault,, uint256 orderId) = _vaultOrderFixture(vault);
+
+        vm.prank(alice);
+        hookWithVault.depositToVault(orderId);
+
+        assertGt(hookWithVault.getOrder(orderId).vaultShares, 0, "shares recorded");
+        assertEq(
+            token0.allowance(address(hookWithVault), address(vault)),
+            0,
+            "allowance must be zeroed even when the vault under-pulls"
+        );
+    }
+
+    /// @notice A successful deposit emits VaultDeposited (previously the deposit path was silent).
+    function test_VaultFix_SuccessfulDepositEmitsEvent() public {
+        MockERC4626 vault = new MockERC4626(address(token0));
+        (ILAwareLimitOrderHook hookWithVault,, uint256 orderId) = _vaultOrderFixture(vault);
+        uint256 outputAmount = hookWithVault.getOrder(orderId).amount0;
+
+        vm.expectEmit(true, false, false, true, address(hookWithVault));
+        emit ILAwareLimitOrderHook.VaultDeposited(orderId, outputAmount, outputAmount); // mock is 1:1
+        vm.prank(alice);
+        hookWithVault.depositToVault(orderId);
+    }
+
+    /// @notice A reverting vault still no-ops gracefully, but now surfaces the reason and resets the
+    ///         approval; the order stays fully claimable via the non-vault path.
+    function test_VaultFix_FailedDepositEmitsReasonAndStaysClaimable() public {
+        MockERC4626 vault = new MockERC4626(address(token0));
+        vault.setShouldRevert(true);
+        (ILAwareLimitOrderHook hookWithVault, PoolKey memory vaultPoolKey, uint256 orderId) =
+            _vaultOrderFixture(vault);
+        uint256 outputAmount = hookWithVault.getOrder(orderId).amount0;
+
+        vm.recordLogs();
+        vm.prank(alice);
+        hookWithVault.depositToVault(orderId); // graceful: must NOT revert
+
+        // VaultDepositFailed carries non-empty raw revert data so integrators can tell a capped or
+        // paused vault apart from a hostile one.
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool found;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == ILAwareLimitOrderHook.VaultDepositFailed.selector) {
+                found = true;
+                (uint256 assets, bytes memory reason) = abi.decode(logs[i].data, (uint256, bytes));
+                assertEq(assets, outputAmount, "event reports the offered amount");
+                assertGt(reason.length, 0, "revert reason must be surfaced, not swallowed");
+                assertEq(uint256(logs[i].topics[1]), orderId, "event is indexed by orderId");
+            }
+        }
+        assertTrue(found, "VaultDepositFailed must be emitted");
+
+        assertEq(hookWithVault.getOrder(orderId).vaultShares, 0, "order untouched");
+        assertEq(token0.allowance(address(hookWithVault), address(vault)), 0, "approval reset on failure");
+
+        uint256 aliceBefore = token0.balanceOf(alice);
+        vm.prank(alice);
+        hookWithVault.claimOrder(orderId, vaultPoolKey);
+        assertEq(token0.balanceOf(alice) - aliceBefore, outputAmount, "still claimable in full");
     }
 
     /// @notice B3 (saturating eligibility cast): a swap on a hook pool whose price is so high that
