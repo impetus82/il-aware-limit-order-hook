@@ -36,6 +36,37 @@ contract TrapToken is MockERC20 {
     }
 }
 
+interface IHookReentry {
+    function cancelOrder(uint256 orderId) external;
+}
+
+/// @dev ERC20 that OWNS a limit order and, on the hook's fill-body settle transfer (hook ->
+///      poolManager), re-enters cancelOrder(orderId) as that owner — the LOW #3 execution-path
+///      reentrancy vector. Post-fix the reentrant call reverts (ExecutionInProgress), which bubbles
+///      into the fill body and is caught (OrderExecutionFailed), so no double-spend occurs.
+contract ReenterCancelToken is MockERC20 {
+    address public hook;
+    uint256 public orderId;
+    address public trapTo;
+    bool public armed;
+
+    constructor() MockERC20("Reenter", "RE", 18) {}
+
+    function arm(address _hook, uint256 _orderId, address _trapTo) external {
+        hook = _hook;
+        orderId = _orderId;
+        trapTo = _trapTo;
+        armed = true;
+    }
+
+    function transfer(address to, uint256 amount) public override returns (bool) {
+        if (armed && msg.sender == hook && to == trapTo) {
+            IHookReentry(hook).cancelOrder(orderId); // reenter mid-fill, as the order's owner
+        }
+        return super.transfer(to, amount);
+    }
+}
+
 /// @title Regression tests for the two P0 audit findings (2026-08-08 internal audit)
 /// @notice
 ///   MEDIUM #1 — active-tick scan burns MAX_ACTIVE_TICK_SCAN on INELIGIBLE ticks, so an
@@ -216,5 +247,89 @@ contract AuditP0RegressionTest is Test {
         // Swap survived; the un-fillable order was skipped and stays resting (recoverable via cancel).
         assertFalse(hook.getOrder(orderId).isFilled, "trapped order must be skipped, not filled");
         assertEq(hook.ownerOf(orderId), alice, "skipped order stays resting and owned by alice");
+    }
+
+    /// @notice LOW #3 — a token that re-enters cancelOrder from inside the fill's settle transfer must
+    ///         NOT be able to refund-and-burn the order mid-fill (double-spend). The isExecuting gate
+    ///         makes cancel/claim/deposit/create revert while a fill is in progress; that revert is
+    ///         caught, the order stays resting with its principal intact, and a normal cancel still works.
+    function test_M3_reentrantCancelDuringFillIsBlocked() public {
+        ReenterCancelToken tA = new ReenterCancelToken();
+        ReenterCancelToken tB = new ReenterCancelToken();
+        (ReenterCancelToken c0, ReenterCancelToken c1) = address(tA) < address(tB) ? (tA, tB) : (tB, tA);
+
+        PoolKey memory pk = PoolKey({
+            currency0: Currency.wrap(address(c0)),
+            currency1: Currency.wrap(address(c1)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: hook
+        });
+        manager.initialize(pk, TickMath.getSqrtPriceAtTick(0));
+
+        c0.mint(address(this), 10_000e18);
+        c1.mint(address(this), 10_000e18);
+        c0.approve(address(modifyLiquidityRouter), type(uint256).max);
+        c1.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            pk,
+            IPoolManager.ModifyLiquidityParams({tickLower: -1200, tickUpper: 1200, liquidityDelta: 10_000e18, salt: bytes32(0)}),
+            ""
+        );
+
+        // A SECOND, independent victim order (alice) selling the SAME token funds extra c0 custody in
+        // the hook — the audit's precondition. Without it, a reentrant refund empties the hook and the
+        // continuing settle self-reverts harmlessly; WITH it, a pre-fix reentrant cancel corrupts the
+        // in-flight bucket iteration and DoSes the whole user swap. High trigger => stays resting.
+        c0.mint(alice, 1e18);
+        vm.startPrank(alice);
+        c0.approve(address(hook), type(uint256).max);
+        uint256 victimId = hook.createLimitOrder(pk, true, 1e18, 5e18);
+        vm.stopPrank();
+
+        // The reenter token itself owns a SELL order (sells c0), so its reentrant cancelOrder passes
+        // the ownerOf check.
+        c0.mint(address(c0), 1e18);
+        vm.prank(address(c0));
+        c0.approve(address(hook), type(uint256).max);
+        vm.prank(address(c0));
+        uint256 orderId = hook.createLimitOrder(pk, true, 1e18, 1.002e18);
+        assertEq(hook.ownerOf(orderId), address(c0), "token owns the order");
+
+        // Arm: on the hook -> poolManager settle transfer, re-enter cancelOrder as the owner.
+        c0.arm(address(hook), orderId, address(manager));
+
+        uint256 hookC0Before = c0.balanceOf(address(hook)); // == 2e18: both order principals
+
+        c1.mint(address(this), 50e18);
+        c1.approve(address(swapRouter), type(uint256).max);
+
+        // The reentrant cancel reverts (gated), which bubbles into the fill and is caught.
+        vm.expectEmit(true, false, false, true, address(hook));
+        emit OrderExecutionFailed(orderId, "FillReverted");
+
+        swapRouter.swap(
+            pk,
+            IPoolManager.SwapParams({
+                zeroForOne: false,
+                amountSpecified: -50e18,
+                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        // No double-spend and no DoS: swap completed, both orders untouched, all principal custodied.
+        assertEq(hook.ownerOf(orderId), address(c0), "attacker order must NOT be cancelled/burned by the reentrant call");
+        assertFalse(hook.getOrder(orderId).isFilled, "attacker order must not be marked filled (fill reverted cleanly)");
+        assertEq(hook.ownerOf(victimId), alice, "victim order must be untouched");
+        assertEq(c0.balanceOf(address(hook)), hookC0Before, "no double-spend: both principals still fully custodied");
+
+        // The owner can still cancel normally (outside execution) and recover its principal.
+        vm.prank(address(c0));
+        hook.cancelOrder(orderId);
+        assertEq(c0.balanceOf(address(c0)), 1e18, "owner recovers principal via a normal cancel");
+        vm.expectRevert();
+        hook.ownerOf(orderId);
     }
 }

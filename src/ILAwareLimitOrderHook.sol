@@ -132,6 +132,12 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     ///         share price — reverting leaves the output untouched and claimable as normal.
     error ZeroSharesMinted();
 
+    /// @notice Thrown when a state-mutating user entrypoint is re-entered from within order
+    ///         execution (audit P0 / LOW #3). `nonReentrant` alone does not cover this: the
+    ///         afterSwap execution path holds no ReentrancyGuard lock, so a token callback fired
+    ///         during a fill's settle/refund could otherwise re-enter cancel/claim/deposit/create.
+    error ExecutionInProgress();
+
     /*//////////////////////////////////////////////////////////////
                             DATA STRUCTURES
     //////////////////////////////////////////////////////////////*/
@@ -397,7 +403,9 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @dev Transfers the input token from the caller to this contract.
     ///      The order is indexed by its aligned tick and inserted into the
     ///      sorted active tick linked list for efficient scanning.
-    ///      Protected by ReentrancyGuard against ERC-777 callbacks.
+    ///      Reentrancy-protected two ways: `nonReentrant` blocks direct reentry, and the
+    ///      `isExecuting` gate blocks reentry from within a fill's settle/refund token callback
+    ///      (the afterSwap execution path holds no ReentrancyGuard lock). See LOW #3.
     /// @param poolKey The Uniswap V4 pool to associate the order with
     /// @param zeroForOne True = selling token0 for token1; False = buying token0 with token1
     /// @param amountIn Amount of input token to deposit
@@ -408,6 +416,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         nonReentrant
         returns (uint256 orderId)
     {
+        if (isExecuting) revert ExecutionInProgress(); // LOW #3: block reentry from within a fill
         if (amountIn == 0) revert InvalidAmount();
         if (triggerPrice == 0) revert InvalidTriggerPrice();
         // L1: reject prices that would panic (0x11) in uint128ToSqrtPrice below, or later reach the
@@ -470,9 +479,12 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @notice Cancel an active order and return deposited tokens
     /// @dev Removes the order from its tick bucket. If the bucket becomes empty,
     ///      removes the tick from the active linked list. Burns the ERC721 NFT.
-    ///      Protected by ReentrancyGuard against ERC-777 callbacks.
+    ///      Reentrancy-protected two ways: `nonReentrant` blocks direct reentry, and the
+    ///      `isExecuting` gate blocks reentry from within a fill's settle/refund token callback
+    ///      (the afterSwap execution path holds no ReentrancyGuard lock). See LOW #3.
     /// @param orderId The ID of the order to cancel
     function cancelOrder(uint256 orderId) external nonReentrant {
+        if (isExecuting) revert ExecutionInProgress(); // LOW #3: block reentry from within a fill
         LimitOrder storage order = orders[orderId];
 
         if (ownerOf(orderId) != msg.sender) revert NotOrderCreator();
@@ -1239,6 +1251,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     ///      to avoid reentrancy with pool. Vault deposit failures are caught gracefully.
     /// @param orderId The filled limit order whose output tokens should be deposited
     function depositToVault(uint256 orderId) external nonReentrant {
+        if (isExecuting) revert ExecutionInProgress(); // LOW #3: block reentry from within a fill
         LimitOrder storage order = orders[orderId];
         if (ownerOf(orderId) != msg.sender) revert NotOrderCreator();
         if (!order.isFilled) revert OrderNotFilled();
@@ -1278,6 +1291,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     /// @param orderId   The filled order to claim
     /// @param poolKey   Pool key the order was placed in (needed for IL baseline lookup)
     function claimOrder(uint256 orderId, PoolKey calldata poolKey) external nonReentrant {
+        if (isExecuting) revert ExecutionInProgress(); // LOW #3: block reentry from within a fill
         LimitOrder storage order = orders[orderId];
         if (!order.isFilled) revert OrderNotFilled();
         if (ownerOf(orderId) != msg.sender) revert NotOrderCreator();
