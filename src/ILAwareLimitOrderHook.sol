@@ -430,16 +430,20 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
         address token0Addr = Currency.unwrap(poolKey.currency0);
         address token1Addr = Currency.unwrap(poolKey.currency1);
 
-        // Transfer tokens to hook (custody)
-        if (zeroForOne) {
-            IERC20(token0Addr).safeTransferFrom(msg.sender, address(this), uint256(amountIn));
-        } else {
-            IERC20(token1Addr).safeTransferFrom(msg.sender, address(this), uint256(amountIn));
-        }
+        // L4: transfer input into custody and book the ACTUALLY-received amount, not the requested
+        // amountIn. A fee-on-transfer or negative-rebase token delivers less than amountIn; recording
+        // amountIn would over-state custody and let earlier withdrawers drain later claimants. This
+        // mirrors the measured-receipt pattern already used on the claimOrder redeem path. For a
+        // standard ERC20 received == amountIn exactly, so behaviour is unchanged.
+        address inToken = zeroForOne ? token0Addr : token1Addr;
+        uint256 balBefore = IERC20(inToken).balanceOf(address(this));
+        IERC20(inToken).safeTransferFrom(msg.sender, address(this), uint256(amountIn));
+        uint96 received = (IERC20(inToken).balanceOf(address(this)) - balBefore).toUint96();
+        if (received == 0) revert InvalidAmount();
 
         orders[orderId] = LimitOrder({
-            amount0: zeroForOne ? amountIn : 0,
-            amount1: zeroForOne ? 0 : amountIn,
+            amount0: zeroForOne ? received : 0,
+            amount1: zeroForOne ? 0 : received,
             token0: token0Addr,
             token1: token1Addr,
             triggerPrice: triggerPrice,
@@ -1222,6 +1226,14 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     ///      custody or from fees. A precise on-chain IL / TWAP oracle was judged disproportionate
     ///      precisely because the payout is yield-capped. `sqrtPriceCurrent` is the fill price
     ///      captured BEFORE the hook's own internal swap (no self-inflicted skew).
+    ///
+    ///      DESIGN (INFO #5): the owner picks `triggerPrice` (hence `sqrtPriceAtFill`), so a trigger
+    ///      far from `sqrtPriceBaseline` makes `ilAmount >> yieldEarned` and the rebate captures ALL
+    ///      of the order's OWN vault yield, leaving ~0 surplus for `pendingFees`. This is intended,
+    ///      not a leak: returning an order's own yield to its owner IS the product; the payout is
+    ///      yield-capped (it can never touch other orders or fees, per SAFETY above); and protocol
+    ///      revenue is the separate `feeBps` execution fee on output, NOT a cut of user yield. So
+    ///      `YieldSurplusToFees` is a best-effort residual, never a guaranteed revenue stream.
     function _calculateIL(uint160 sqrtPriceEntry, uint160 sqrtPriceCurrent, uint128 outputNotional)
         internal
         pure

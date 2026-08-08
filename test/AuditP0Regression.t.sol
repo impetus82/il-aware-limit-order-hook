@@ -67,6 +67,28 @@ contract ReenterCancelToken is MockERC20 {
     }
 }
 
+/// @dev Fee-on-transfer ERC20: every transfer/transferFrom delivers `amount` minus `feeBps`, the fee
+///      burned. Used to prove the hook records the MEASURED receipt, not the requested amountIn (LOW #4).
+contract FeeOnTransferToken is MockERC20 {
+    uint256 public immutable feeBps;
+
+    constructor(uint256 _feeBps) MockERC20("FoT", "FOT", 18) {
+        feeBps = _feeBps;
+    }
+
+    function transfer(address to, uint256 amount) public override returns (bool) {
+        super.transfer(to, amount);
+        burn(to, (amount * feeBps) / 10_000);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) public override returns (bool) {
+        super.transferFrom(from, to, amount);
+        burn(to, (amount * feeBps) / 10_000);
+        return true;
+    }
+}
+
 /// @title Regression tests for the two P0 audit findings (2026-08-08 internal audit)
 /// @notice
 ///   MEDIUM #1 — active-tick scan burns MAX_ACTIVE_TICK_SCAN on INELIGIBLE ticks, so an
@@ -331,5 +353,50 @@ contract AuditP0RegressionTest is Test {
         assertEq(c0.balanceOf(address(c0)), 1e18, "owner recovers principal via a normal cancel");
         vm.expectRevert();
         hook.ownerOf(orderId);
+    }
+
+    /// @notice LOW #4 — createLimitOrder must book the MEASURED receipt, not the requested amountIn.
+    ///         With a fee-on-transfer token, recording amountIn over-states custody so the last
+    ///         claimant's cancel reverts (insolvency). Measuring keeps pooled custody solvent.
+    function test_M4_measuredReceiptOnDeposit() public {
+        FeeOnTransferToken fA = new FeeOnTransferToken(100); // 1% fee
+        FeeOnTransferToken fB = new FeeOnTransferToken(100);
+        (FeeOnTransferToken c0, FeeOnTransferToken c1) = address(fA) < address(fB) ? (fA, fB) : (fB, fA);
+
+        PoolKey memory pk = PoolKey({
+            currency0: Currency.wrap(address(c0)),
+            currency1: Currency.wrap(address(c1)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: hook
+        });
+        manager.initialize(pk, TickMath.getSqrtPriceAtTick(0));
+
+        address bob = makeAddr("bob");
+        c0.mint(alice, 1e18);
+        c0.mint(bob, 1e18);
+        vm.prank(alice);
+        c0.approve(address(hook), type(uint256).max);
+        vm.prank(bob);
+        c0.approve(address(hook), type(uint256).max);
+
+        // Two independent SELL orders in the same FoT token (high trigger => just rest in custody).
+        vm.prank(alice);
+        uint256 aId = hook.createLimitOrder(pk, true, 1e18, 5e18);
+        vm.prank(bob);
+        uint256 bId = hook.createLimitOrder(pk, true, 1e18, 5e18);
+
+        // Recorded custody == what the hook actually received (0.99e18), not the requested 1e18.
+        assertEq(hook.getOrder(aId).amount0, 99e16, "recorded amount must be the measured receipt");
+        assertEq(hook.getOrder(bId).amount0, 99e16, "recorded amount must be the measured receipt");
+        assertEq(c0.balanceOf(address(hook)), 2 * 99e16, "hook custody == sum of recorded amounts (solvent)");
+
+        // Both users can cancel: the SECOND cancel must NOT revert (pre-fix it would, since the hook
+        // recorded 2e18 but only held 1.98e18).
+        vm.prank(alice);
+        hook.cancelOrder(aId);
+        vm.prank(bob);
+        hook.cancelOrder(bId);
+        assertEq(c0.balanceOf(address(hook)), 0, "all custody released, hook solvent throughout");
     }
 }
