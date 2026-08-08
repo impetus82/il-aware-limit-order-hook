@@ -10,43 +10,57 @@ import {IERC20} from "forge-std/interfaces/IERC20.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 
-/// @title LiquidityRouterUnichain - On-chain router for PoolManager unlock callback
-/// @dev Deployed by the script; PoolManager calls unlockCallback on THIS contract (not the EOA)
-/// @notice Unichain: currency0 = USDC (6 dec), currency1 = WETH (18 dec)
+/// @title LiquidityRouterUnichain - recoverable unlock-callback router for USDC/WETH on Unichain
+/// @dev PoolManager calls unlockCallback on THIS contract (not the EOA). Mirrors LiquidityRouterBase:
+///      adds/removes full-range liquidity, settling owed tokens (sync → transferFrom(payer) → settle)
+///      or taking returned tokens. Currency-agnostic (handles amount0/amount1 by sign). Owner-gated.
+///      The v4 position is owned by THIS contract, so `removeLiquidity` is the ONLY exit — without it
+///      the seed would be permanently locked (as the first Base seed was). Unichain: currency0 = USDC.
 contract LiquidityRouterUnichain is IUnlockCallback {
     IPoolManager public immutable poolManager;
     address public immutable owner;
+    int256 public immutable liquidityDelta;
 
     // Full range ticks (tickSpacing=60)
     int24 constant TICK_LOWER = -887220;
     int24 constant TICK_UPPER = 887220;
 
-    // Micro liquidity: ~$0.10 at 3500 USDC/WETH
-    int256 constant LIQUIDITY_DELTA = 1e10;
+    /// @notice Liquidity this router currently holds in the position (guards removeLiquidity).
+    uint256 public deployed;
 
-    constructor(IPoolManager _poolManager) {
+    constructor(IPoolManager _poolManager, int256 _liquidityDelta) {
         poolManager = _poolManager;
         owner = msg.sender;
+        liquidityDelta = _liquidityDelta;
     }
 
     /// @notice Add liquidity: approve this router for tokens, then call this
     function addLiquidity(PoolKey calldata poolKey) external {
         require(msg.sender == owner, "Only owner");
-        bytes memory callbackData = abi.encode(poolKey, msg.sender);
-        poolManager.unlock(callbackData);
+        require(liquidityDelta > 0, "delta must be positive");
+        poolManager.unlock(abi.encode(poolKey, msg.sender, liquidityDelta));
+        deployed += uint256(liquidityDelta);
+    }
+
+    /// @notice Withdraw seeded liquidity (plus any accrued fees) back to the owner.
+    /// @param amount Liquidity units to burn; pass `deployed()` to exit fully.
+    function removeLiquidity(PoolKey calldata poolKey, uint256 amount) external {
+        require(msg.sender == owner, "Only owner");
+        require(amount > 0 && amount <= deployed, "bad amount");
+        deployed -= amount;
+        poolManager.unlock(abi.encode(poolKey, msg.sender, -int256(amount)));
     }
 
     /// @notice Callback from PoolManager.unlock()
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
         require(msg.sender == address(poolManager), "Only PoolManager");
 
-        (PoolKey memory poolKey, address payer) = abi.decode(data, (PoolKey, address));
+        (PoolKey memory poolKey, address payer, int256 delta_) = abi.decode(data, (PoolKey, address, int256));
 
-        // Add liquidity
         (BalanceDelta delta,) = poolManager.modifyLiquidity(
             poolKey,
             IPoolManager.ModifyLiquidityParams({
-                tickLower: TICK_LOWER, tickUpper: TICK_UPPER, liquidityDelta: LIQUIDITY_DELTA, salt: bytes32(0)
+                tickLower: TICK_LOWER, tickUpper: TICK_UPPER, liquidityDelta: delta_, salt: bytes32(0)
             }),
             ""
         );
@@ -55,28 +69,26 @@ contract LiquidityRouterUnichain is IUnlockCallback {
         console2.log("Delta amount0 (USDC):", int256(delta.amount0()));
         console2.log("Delta amount1 (WETH):", int256(delta.amount1()));
 
-        // Settle: pay tokens owed to PoolManager
-        // Negative delta = we owe tokens to pool
+        // Negative delta = we owe tokens to the pool: sync, transfer from payer, settle.
         if (delta.amount0() < 0) {
-            uint256 owed0 = uint256(uint128(-delta.amount0()));
             poolManager.sync(poolKey.currency0);
-            IERC20(Currency.unwrap(poolKey.currency0)).transferFrom(payer, address(poolManager), owed0);
+            IERC20(Currency.unwrap(poolKey.currency0)).transferFrom(
+                payer, address(poolManager), uint256(uint128(-delta.amount0()))
+            );
             poolManager.settle();
         }
         if (delta.amount1() < 0) {
-            uint256 owed1 = uint256(uint128(-delta.amount1()));
             poolManager.sync(poolKey.currency1);
-            IERC20(Currency.unwrap(poolKey.currency1)).transferFrom(payer, address(poolManager), owed1);
+            IERC20(Currency.unwrap(poolKey.currency1)).transferFrom(
+                payer, address(poolManager), uint256(uint128(-delta.amount1()))
+            );
             poolManager.settle();
         }
 
-        // Take any positive delta (shouldn't happen on add liquidity)
-        if (delta.amount0() > 0) {
-            poolManager.take(poolKey.currency0, payer, uint256(uint128(delta.amount0())));
-        }
-        if (delta.amount1() > 0) {
-            poolManager.take(poolKey.currency1, payer, uint256(uint128(delta.amount1())));
-        }
+        // Positive delta = the pool owes us: on removeLiquidity this is the returned principal plus any
+        // accrued fees; on addLiquidity it should not occur, but is forwarded to the payer either way.
+        if (delta.amount0() > 0) poolManager.take(poolKey.currency0, payer, uint256(uint128(delta.amount0())));
+        if (delta.amount1() > 0) poolManager.take(poolKey.currency1, payer, uint256(uint128(delta.amount1())));
 
         return "";
     }
@@ -105,12 +117,20 @@ contract AddLiquidityUnichain is Script {
     uint24 constant POOL_FEE = 3000; // 0.30% — matches pool initialized via DeployHookathon.s.sol
     int24 constant TICK_SPACING = 60;
 
+    /// @dev Seed size, passed to the router which owns the position (recoverable via removeLiquidity).
+    int256 constant LIQUIDITY_DELTA = 1e10;
+
     function run() external {
         uint256 deployerPk = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerPk);
+        // Overridable so a freshly redeployed Unichain hook can be wired up without editing the
+        // constant — its address is unknown until DeployHookathon broadcasts the fresh vault + hook.
+        address hookAddr = vm.envOr("HOOK", HOOK);
 
         console2.log("=== Add Liquidity to Unichain USDC/WETH Pool ===");
         console2.log("Deployer:", deployer);
+        console2.log("Hook:    ", hookAddr);
+        require(hookAddr.code.length > 0, "AddLiquidityUnichain: hook not deployed (wrong chain?)");
 
         // Unichain: currency0 = USDC, currency1 = WETH
         PoolKey memory poolKey = PoolKey({
@@ -118,7 +138,7 @@ contract AddLiquidityUnichain is Script {
             currency1: Currency.wrap(WETH),
             fee: POOL_FEE,
             tickSpacing: TICK_SPACING,
-            hooks: IHooks(HOOK)
+            hooks: IHooks(hookAddr)
         });
 
         // Check balances
@@ -133,7 +153,7 @@ contract AddLiquidityUnichain is Script {
         vm.startBroadcast(deployerPk);
 
         // 1. Deploy router contract on-chain
-        LiquidityRouterUnichain router = new LiquidityRouterUnichain(POOL_MANAGER);
+        LiquidityRouterUnichain router = new LiquidityRouterUnichain(POOL_MANAGER, LIQUIDITY_DELTA);
         console2.log("Router deployed at:", address(router));
 
         // 2. Approve router to pull tokens from deployer (for transferFrom in callback)
