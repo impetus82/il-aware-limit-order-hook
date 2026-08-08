@@ -696,14 +696,17 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                 // Cache next before potential removal
                 int24 nextTick = nextActiveTick[poolId][tick];
 
-                _processTickBucket(poolId, tick, currentPrice, poolKey);
+                // Only ticks that actually held an ELIGIBLE order consume the scan budget (audit
+                // P0 #1). Otherwise >100 ineligible far-side ticks exhaust MAX_ACTIVE_TICK_SCAN
+                // before the walk reaches genuinely eligible orders, so they never fill.
+                bool hadEligible = _processTickBucket(poolId, tick, currentPrice, poolKey);
 
                 // If bucket is now empty after processing, remove from list
                 if (tickToOrders[poolId][tick].length == 0) {
                     _removeActiveTick(poolId, tick);
                 }
 
-                activeTickCount++;
+                if (hadEligible) activeTickCount++;
                 tick = nextTick;
             }
         } else {
@@ -717,14 +720,17 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
                 // Cache prev before potential removal
                 int24 prevTick = prevActiveTick[poolId][tick];
 
-                _processTickBucket(poolId, tick, currentPrice, poolKey);
+                // Only ticks that actually held an ELIGIBLE order consume the scan budget (audit
+                // P0 #1). Otherwise >100 ineligible far-side ticks exhaust MAX_ACTIVE_TICK_SCAN
+                // before the walk reaches genuinely eligible orders, so they never fill.
+                bool hadEligible = _processTickBucket(poolId, tick, currentPrice, poolKey);
 
                 // If bucket is now empty after processing, remove from list
                 if (tickToOrders[poolId][tick].length == 0) {
                     _removeActiveTick(poolId, tick);
                 }
 
-                activeTickCount++;
+                if (hadEligible) activeTickCount++;
                 tick = prevTick;
             }
         }
@@ -735,7 +741,13 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     ///      lazy cleanup of filled/cancelled orders.
     ///      Phase 3.14: Failed executions emit OrderExecutionFailed and skip
     ///      (order stays in bucket for retry on next swap).
-    function _processTickBucket(PoolId poolId, int24 tick, uint128 currentPrice, PoolKey calldata poolKey) internal {
+    /// @return hadEligible True if the bucket held at least one order eligible at `currentPrice`
+    ///         (whether it filled or was skipped). Ineligible-only buckets return false so the
+    ///         caller does not spend a scan-budget slot on them (audit P0 #1).
+    function _processTickBucket(PoolId poolId, int24 tick, uint128 currentPrice, PoolKey calldata poolKey)
+        internal
+        returns (bool hadEligible)
+    {
         uint256[] storage orderIdsInTick = tickToOrders[poolId][tick];
 
         uint256 i = 0;
@@ -765,6 +777,7 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             }
 
             if (eligible) {
+                hadEligible = true;
                 // Phase 3.14: graceful execution - skip on failure instead of revert
                 bool success = _executeOrder(poolKey, order, orderId);
                 if (success) {
@@ -819,10 +832,6 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
     {
         isExecuting = true;
 
-        // Capture current owner for refunds and events (ERC721 owner at fill time)
-        address orderOwner = ownerOf(orderId);
-        uint96 amountIn = order.zeroForOne ? order.amount0 : order.amount1;
-
         // Current pool price: used for the pre-swap price-gate check (Stage A) and recorded as the
         // pre-internal-swap fill price for the IL rebate in claimOrder (order.sqrtPriceAtFill).
         (uint160 currentSqrtPriceX96,,,) = poolManager.getSlot0(poolKey.toId());
@@ -842,6 +851,43 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             emit OrderExecutionFailed(orderId, "PriceGate");
             return false;
         }
+
+        // Audit P0 #2: run the swap/settle/take/refund body behind an external self-call try/catch so
+        // that ANY revert on the fill path — a swap output exceeding the uint96 custody field, or a
+        // misbehaving token on the input settle / partial-fill refund — degrades to a graceful skip
+        // instead of reverting the user's whole swap (honoring the "never revert inside afterSwap"
+        // invariant, alongside _saturatingPrice / the Stage A-B gates). A caught revert also unwinds
+        // this nested swap's PoolManager deltas, so the pool stays consistent and the order rests.
+        try this._fillOrder(poolKey, orderId, currentSqrtPriceX96, sqrtPriceLimitX96) returns (bool filled) {
+            success = filled;
+        } catch {
+            emit OrderExecutionFailed(orderId, "FillReverted");
+            success = false;
+        }
+
+        isExecuting = false;
+        return success;
+    }
+
+    /// @notice Fill body of an eligible order: internal swap, settle input, take output, mark filled.
+    /// @dev EXTERNAL only so `_executeOrder` can wrap it in a try/catch (audit P0 #2); gated to the
+    ///      hook itself. Runs inside the outer swap's PoolManager lock — a revert here unwinds this
+    ///      nested swap's deltas cleanly. Not `nonReentrant`: `isExecuting` (already set by the caller,
+    ///      and unaffected by entering this external call) blocks the recursive afterSwap, and no user
+    ///      entrypoint is reachable between the self-call and its return.
+    /// @return filled True if the order filled; false if the swap consumed nothing (price gate).
+    function _fillOrder(
+        PoolKey calldata poolKey,
+        uint256 orderId,
+        uint160 currentSqrtPriceX96,
+        uint160 sqrtPriceLimitX96
+    ) external returns (bool filled) {
+        require(msg.sender == address(this), "internal");
+        LimitOrder storage order = orders[orderId];
+
+        // Capture current owner for refunds and events (ERC721 owner at fill time)
+        address orderOwner = ownerOf(orderId);
+        uint96 amountIn = order.zeroForOne ? order.amount0 : order.amount1;
 
         IPoolManager.SwapParams memory swapParams = IPoolManager.SwapParams({
             zeroForOne: order.zeroForOne,
@@ -865,7 +911,6 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             // Stage B: the swap consumed nothing (hit the price gate immediately) => zero delta on
             // both currencies. Skip clean, no settle/take, order stays resting for a later swap.
             if (actualInput == 0) {
-                isExecuting = false;
                 emit OrderExecutionFailed(orderId, "PriceGate");
                 return false;
             }
@@ -899,7 +944,6 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             uint256 actualInput = uint256(uint128(-deltaAmount1));
 
             if (actualInput == 0) {
-                isExecuting = false;
                 emit OrderExecutionFailed(orderId, "PriceGate");
                 return false;
             }
@@ -928,7 +972,6 @@ contract ILAwareLimitOrderHook is BaseHook, ReentrancyGuard, Ownable, ERC721 {
             emit OrderFilled(orderId, orderOwner, uint96(actualInput), netAmount.toUint96(), _saturatingPrice(currentSqrtPriceX96));
         }
 
-        isExecuting = false;
         return true;
     }
 
