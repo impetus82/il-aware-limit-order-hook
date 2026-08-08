@@ -212,6 +212,25 @@ its message):
 | **J2** | LOW | IL uses instantaneous spot (no TWAP) → sandwich can inflate computed IL | Accepted (see §9) — `min(yield, IL)` cap + `RebateExceedsRedeemed` bound it to the user's own yield; `sqrtPriceAtFill` captured pre-internal-swap |
 | **L1** | LOW | Extreme `triggerPrice` could panic in `uint128ToSqrtPrice` / defeat the M4 gate | `MAX_TRIGGER_PRICE = 1e36` bound in `createLimitOrder` (clean revert before any transfer/mint); makes the M4 overflow clamp dead code for every creatable order |
 
+### 8.1 Internal adversarial audit (2026-08-08)
+
+A second, self-run multi-agent adversarial pass (graded against OpenZeppelin's audit of Uniswap Labs'
+DualPoolHook, used as a checklist) surfaced two DoS and three lower items. Each fix ships with a
+regression test in `test/AuditP0Regression.t.sol` that **fails on the pre-fix code** and passes after.
+**No finding caused fund theft** — the two MEDIUMs are liveness (funds stay recoverable via cancel).
+
+| # | Sev | Finding | Resolution |
+|---|-----|---------|------------|
+| **A1** | MED | Active-tick scan counted INELIGIBLE ticks against `MAX_ACTIVE_TICK_SCAN`, so >100 far-side ticks (dust-weaponizable or organic) starved eligible orders → they never filled | `_processTickBucket` returns whether it did eligible work; only such ticks spend a scan slot (PR #21) |
+| **A2** | MED | `netAmount.toUint96()` / the push refund could revert uncaught inside `afterSwap`, DoSing the whole user swap on exotic asymmetric-decimal pools | Fill body moved to an external self-gated `_fillOrder` wrapped in try/catch → any fill-path revert degrades to `OrderExecutionFailed` and unwinds the nested PoolManager deltas (PR #21) |
+| **A3** | LOW | Execution path holds no ReentrancyGuard lock → a callback token could re-enter cancel/claim/deposit mid-fill and double-spend when the hook custodies another order in the same token | Mutual-exclusion gate: `create/cancel/deposit/claim` revert `ExecutionInProgress()` while `isExecuting` (PR #22) |
+| **A4** | LOW | `createLimitOrder` booked the requested `amountIn`, not the measured receipt → fee-on-transfer / rebase tokens over-state custody → last claimant insolvent | Measured-receipt on deposit (`balanceOf` delta), mirroring the claim path; a zero net receipt is rejected |
+| **A5** | INFO | A trigger far from baseline lets an owner rebate ALL of their own vault yield → `pendingFees` surplus ≈ 0 | Accepted by design: returning an order's own yield IS the product; protocol revenue is the separate `feeBps` execution fee, not a yield cut. Documented at `_calculateIL` |
+
+> **Deployment note:** these fixes are merged to `main`, but the live Base/Unichain hooks are immutable
+> and predate them, so they take effect only on the **next redeploy**. Both existing pools use standard
+> tokens (WETH/USDC) at sane prices, where A1 requires a grown book and A2/A4 are unreachable.
+
 ---
 
 ## 9. Known & accepted risks
