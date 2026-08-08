@@ -10,14 +10,14 @@ described below; the raw-call reference is included for integrators who prefer d
 
 | | Base (8453) | Unichain (130) |
 |---|---|---|
-| **Hook** | [`0x1afeB37bdC763c1FC8CCB4E30c39BFFe139894Ce`](https://basescan.org/address/0x1afeb37bdc763c1fc8ccb4e30c39bffe139894ce) | [`0x8C19f1641946c662308000bB4E2Eaf684c81d4CE`](https://uniscan.xyz/address/0x8C19f1641946c662308000bB4E2Eaf684c81d4CE) |
+| **Hook** | [`0x4fB56294f7bFf30A4d85c1bA676f0CFdB24114ce`](https://basescan.org/address/0x4fb56294f7bff30a4d85c1ba676f0cfdb24114ce) | [`0x3983130fcd18606afe659acdddb0018d21c254ce`](https://uniscan.xyz/address/0x3983130fcd18606afe659acdddb0018d21c254ce) |
 | PoolManager (v4) | `0x498581fF718922c3f8e6A244956aF099B2652b2b` | `0x1F98400000000000000000000000000000000004` |
 | StateView | `0xa3c0c9b65bad0b08107aa264b0f3db444b867a71` | `0x86e8631a016f9068c3f085faf484ee3f5fdee8f2` |
 | WETH | `0x4200000000000000000000000000000000000006` (18 dec) | `0x4200000000000000000000000000000000000006` (18 dec) |
 | USDC | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` (6 dec) | `0x078D782b760474a361dDA0AF3839290b0EF57AD6` (6 dec) |
-| WETH/USDC pool (fee 3000, spacing 60) | `0x8d27ee1ba3ae15df876ab2929cc21e23109ba2e3f181222eb795466956727c08` | `0xe1d695d4c147091549aeb6f9e78521a0184a1e7e272a71c12e708c881981f6ba` |
+| WETH/USDC pool (fee 3000, spacing 60) | `0xc92fdde3c2264c8abe30cea3ee4d3ffeeef6ca009117e843158f8f8a5fe6f03e` | `0x093ab4b09860ac96a823165918b56e35837631d16440daa15385b3f0d7b23279` |
 | **currency0** | **WETH** | **USDC** |
-| Yield vault (`yieldVault`, immutable) | **Real Aave** — waBasUSDC `0xC768c589647798a6EE01A91FdE98EF2ed046DBD6` (ERC-4626, `asset()==USDC`) | `SimulatedYieldVault` `0xceee912C708516624E9aC5581c8FCC93eA8eE79d` — **demo, simulated 3% APY**, not real lending |
+| Yield vault (`yieldVault`, immutable) | **Real Aave** — waBasUSDC `0xC768c589647798a6EE01A91FdE98EF2ed046DBD6` (ERC-4626, `asset()==USDC`) | `SimulatedYieldVault` `0xad5e352E96B972BE0ae1eDd2d1f60E69bf1Ee608` — **demo, simulated 3% APY**, not real lending |
 
 > The SDK's per-chain config is locked to these pools by test: `keccak256(abi.encode(poolKey))`
 > must reproduce the on-chain poolIds above (`sdk/test/sdk.test.ts`).

@@ -3,8 +3,8 @@
 **Contract:** `src/ILAwareLimitOrderHook.sol`
 **Type:** Uniswap V4 hook + ERC-721 order registry + ERC-4626 yield integration
 **Deployment (live):** Unichain mainnet (chainId 130)
-- Hook: `0x8C19f1641946c662308000bB4E2Eaf684c81d4CE`
-- SimulatedYieldVault (ERC-4626, ~3% simulated APY): `0xceee912C708516624E9aC5581c8FCC93eA8eE79d`
+- Hook: `0x3983130fcd18606afe659acdddb0018d21c254ce`
+- SimulatedYieldVault (ERC-4626, ~3% simulated APY): `0xad5e352E96B972BE0ae1eDd2d1f60E69bf1Ee608`
 - Pool: USDC/WETH, `currency0 = USDC` (6 decimals), `currency1 = WETH` (18 decimals)
 
 **Status:** All security findings from the audit-prep scan (H1, H2, H3, M1, M2, M3, M4, J1, J2, L1) are fixed — including J1 (the spoofable `lpPositions` telemetry was removed). 70 tests pass (63 unit/integration + 7 Phase-2 invariants: solvency, pool-isolation/bucket-hygiene, vault-share consistency). This document is grounded line-by-line in the deployed source; it is the companion to `docs/AUDIT_SCOPE.md` (scope, actors, assets at risk) and `test/ILAwareLimitOrderHookInvariant.t.sol` (Phase-2 invariants). Per-finding write-ups live in the `fix/pool-isolation-h1-h2` commit history.

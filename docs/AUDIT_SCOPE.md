@@ -307,18 +307,18 @@ affected user's own funds**; all are candidate items for the auditor to independ
 
 | Contract | Address |
 |----------|---------|
-| `ILAwareLimitOrderHook` | `0x8C19f1641946c662308000bB4E2Eaf684c81d4CE` |
-| `SimulatedYieldVault` (demo, out of scope) | `0xceee912C708516624E9aC5581c8FCC93eA8eE79d` |
+| `ILAwareLimitOrderHook` | `0x3983130fcd18606afe659acdddb0018d21c254ce` |
+| `SimulatedYieldVault` (demo, out of scope) | `0xad5e352E96B972BE0ae1eDd2d1f60E69bf1Ee608` |
 | `PoolManager` (v4-core) | `0x1F98400000000000000000000000000000000004` |
 
 - **Pool:** USDC / WETH, `fee = 3000`, `tickSpacing = 60`.
-  `poolId = 0xe1d695d4c147091549aeb6f9e78521a0184a1e7e272a71c12e708c881981f6ba`.
+  `poolId = 0x093ab4b09860ac96a823165918b56e35837631d16440daa15385b3f0d7b23279`.
 - **Token sort order (important):** on Unichain **USDC is `currency0`** (6 decimals) and **WETH is
   `currency1`** (18 decimals) — the opposite of the Base deployment. This is the decimals footgun
   referenced in §5/§9.
 - **Base mainnet (chainId 8453) — production, real Aave vault:** hook
-  `0x1afeB37bdC763c1FC8CCB4E30c39BFFe139894Ce` (verified; pool
-  `0x8d27ee1ba3ae15df876ab2929cc21e23109ba2e3f181222eb795466956727c08`) wires `yieldVault` to the REAL Aave USDC Static
+  `0x4fB56294f7bFf30A4d85c1bA676f0CFdB24114ce` (verified; pool
+  `0xc92fdde3c2264c8abe30cea3ee4d3ffeeef6ca009117e843158f8f8a5fe6f03e`) wires `yieldVault` to the REAL Aave USDC Static
   aToken `waBasUSDC` `0xC768c589647798a6EE01A91FdE98EF2ed046DBD6` (ERC-4626, `asset() == USDC`), so the
   yield rebate is funded by real Aave lending, not the demo vault. On Base **WETH is `currency0`** (opposite
   Unichain), so only USDC-output orders route into the vault. The hook bytecode is identical across chains

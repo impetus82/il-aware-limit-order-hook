@@ -356,19 +356,19 @@ sanity checks before broadcasting. On Base `WETH < USDC`, so a WETH/USDC pool ha
 
 | Network | Contract | Address |
 |---------|----------|---------|
-| Unichain Mainnet | ILAwareLimitOrderHook | [0x8C19f1641946c662308000bB4E2Eaf684c81d4CE](https://uniscan.xyz/address/0x8C19f1641946c662308000bB4E2Eaf684c81d4CE) |
-| Unichain Mainnet | SimulatedYieldVault | [0xceee912C708516624E9aC5581c8FCC93eA8eE79d](https://uniscan.xyz/address/0xceee912C708516624E9aC5581c8FCC93eA8eE79d) |
-| Unichain Mainnet | USDC/WETH Pool | PoolId: `0xe1d695d4c147091549aeb6f9e78521a0184a1e7e272a71c12e708c881981f6ba` |
-| Base Mainnet | ILAwareLimitOrderHook (**real Aave vault**) | [0x1afeB37bdC763c1FC8CCB4E30c39BFFe139894Ce](https://basescan.org/address/0x1afeb37bdc763c1fc8ccb4e30c39bffe139894ce) |
+| Unichain Mainnet | ILAwareLimitOrderHook | [0x3983130fcd18606afe659acdddb0018d21c254ce](https://uniscan.xyz/address/0x3983130fcd18606afe659acdddb0018d21c254ce) |
+| Unichain Mainnet | SimulatedYieldVault | [0xad5e352E96B972BE0ae1eDd2d1f60E69bf1Ee608](https://uniscan.xyz/address/0xad5e352e96b972be0ae1edd2d1f60e69bf1ee608) |
+| Unichain Mainnet | USDC/WETH Pool | PoolId: `0x093ab4b09860ac96a823165918b56e35837631d16440daa15385b3f0d7b23279` |
+| Base Mainnet | ILAwareLimitOrderHook (**real Aave vault**) | [0x4fB56294f7bFf30A4d85c1bA676f0CFdB24114ce](https://basescan.org/address/0x4fb56294f7bff30a4d85c1ba676f0cfdb24114ce) |
 | Base Mainnet | waBasUSDC vault (Aave USDC Static aToken, ERC-4626) | [0xC768c589647798a6EE01A91FdE98EF2ed046DBD6](https://basescan.org/address/0xc768c589647798a6ee01a91fde98ef2ed046dbd6) |
-| Base Mainnet | WETH/USDC Pool | PoolId: `0x8d27ee1ba3ae15df876ab2929cc21e23109ba2e3f181222eb795466956727c08` |
+| Base Mainnet | WETH/USDC Pool | PoolId: `0xc92fdde3c2264c8abe30cea3ee4d3ffeeef6ca009117e843158f8f8a5fe6f03e` |
 
-Unichain pool init tx: [0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a4](https://uniscan.xyz/tx/0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a4)
+Unichain redeploy (hook) tx: [0x9b8727243389d53291029454f5058e7563888de1224b78a1af372d24bfcee8a4](https://uniscan.xyz/tx/0x9b8727243389d53291029454f5058e7563888de1224b78a1af372d24bfcee8a4) — Uniscan-verified. Seed held by the recoverable `LiquidityRouterUnichain` at `0x17d2458D25D3254844EeC70457860CDEEdeAf258`.
 
-Base deploy tx: [0x95143d9220b6d1773f40afb424693d3fbb90858a4337292e5c6246c0a822c1d0](https://basescan.org/tx/0x95143d9220b6d1773f40afb424693d3fbb90858a4337292e5c6246c0a822c1d0) — verified, funded by **real Aave USDC yield**; the WETH/USDC pool (`currency0 = WETH`) is live and seeded. This is the hardened redeploy (saturating IL math, measured-receipt claim); it supersedes `0x17fE80…254Ce`, which never received an order.
+Base deploy tx: [0x93d1f1230f2dffc494b961fa189a47b8b5cdfad6f43130d967ed264909b61eba](https://basescan.org/tx/0x93d1f1230f2dffc494b961fa189a47b8b5cdfad6f43130d967ed264909b61eba) — Basescan-verified, funded by **real Aave USDC yield**; the WETH/USDC pool (`currency0 = WETH`) is live and seeded. This 2026-08-08 redeploy carries the internal-audit fixes (A1/A2 afterSwap DoS, A3 reentrancy gate, A4 measured-receipt); it supersedes `0x1afe…94Ce`.
 
 > **Operational note.** The Base pool's seed liquidity is held by the `LiquidityRouterBase` deployed at
-> [`0x875a7c0277c655278C0a53138Ee2C33698016CaF`](https://basescan.org/address/0x875a7c0277c655278c0a53138ee2c33698016caf)
+> [`0x43C9503c43F987Ca0AF2E2ea4425db08f435eAD8`](https://basescan.org/address/0x43c9503c43f987ca0af2e2ea4425db08f435ead8)
 > (owner = deployer). Deepen the pool with another `addLiquidity`, or withdraw the seed with
 > `removeLiquidity(poolKey, deployed())` — the v4 position belongs to that router, so this address is
 > the only way to reach it.
