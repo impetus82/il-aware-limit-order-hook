@@ -37,3 +37,4 @@ fail_on_revert = false
 # Fork RPC endpoints (M2 — real ERC-4626 Aave integration fork test)
 [rpc_endpoints]
 base = "https://mainnet.base.org"
+unichain = "https://mainnet.unichain.org"

@@ -9,6 +9,9 @@ import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {IERC20} from "forge-std/interfaces/IERC20.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 
 /// @title LiquidityRouterUnichain - recoverable unlock-callback router for USDC/WETH on Unichain
 /// @dev PoolManager calls unlockCallback on THIS contract (not the EOA). Mirrors LiquidityRouterBase:
@@ -105,6 +108,9 @@ contract LiquidityRouterUnichain is IUnlockCallback {
 ///       --rpc-url https://mainnet.unichain.org --broadcast \
 ///       --with-gas-price 100000000 -vvvv
 contract AddLiquidityUnichain is Script {
+    using StateLibrary for IPoolManager;
+    using PoolIdLibrary for PoolKey;
+
     // ── Addresses (Unichain Mainnet) ────────────────────────
     IPoolManager constant POOL_MANAGER = IPoolManager(0x1F98400000000000000000000000000000000004);
 
@@ -113,12 +119,18 @@ contract AddLiquidityUnichain is Script {
     address constant WETH = 0x4200000000000000000000000000000000000006;
     address constant HOOK = 0x8C19f1641946c662308000bB4E2Eaf684c81d4CE; // Phase 6.19 redeploy (SimulatedYieldVault)
 
-    // ── Pool parameters (must match pool initialization) ────
-    uint24 constant POOL_FEE = 3000; // 0.30% — matches pool initialized via DeployHookathon.s.sol
+    // ── Pool parameters ─────────────────────────────────────
+    uint24 constant POOL_FEE = 3000; // 0.30%
     int24 constant TICK_SPACING = 60;
 
-    /// @dev Seed size, passed to the router which owns the position (recoverable via removeLiquidity).
-    int256 constant LIQUIDITY_DELTA = 1e10;
+    /// @dev Init price. Unichain currency0 = USDC, so pool price = WETH_raw/USDC_raw; tick +201002
+    ///      ≈ 1866 USDC/WETH — the mirror image of Base's -201000, matching the existing live pool.
+    int24 constant INIT_TICK = 201002;
+
+    /// @dev Micro full-range seed, passed to the router which OWNS the position (recoverable via
+    ///      removeLiquidity — the old router had no exit, so its seed is stranded). Right-sized to
+    ///      1.4e9 to match Base: ~0.000033 WETH + ~0.061 USDC at INIT_TICK, well within balances.
+    int256 constant LIQUIDITY_DELTA = 1.4e9;
 
     function run() external {
         uint256 deployerPk = vm.envUint("DEPLOYER_PRIVATE_KEY");
@@ -141,39 +153,50 @@ contract AddLiquidityUnichain is Script {
             hooks: IHooks(hookAddr)
         });
 
-        // Check balances
+        require(USDC < WETH, "AddLiquidityUnichain: token sort broken (currency0 must be USDC on Unichain)");
+
+        PoolId id = poolKey.toId();
+        uint160 initSqrtPrice = TickMath.getSqrtPriceAtTick(INIT_TICK);
+        console2.log("Init tick:", INIT_TICK);
+
+        // Thresholds sit just above the deterministic seed cost for LIQUIDITY_DELTA at INIT_TICK,
+        // measured on a Unichain fork (UnichainPoolSetupForkTest). Re-measure if either changes.
         uint256 usdcBal = IERC20(USDC).balanceOf(deployer);
         uint256 wethBal = IERC20(WETH).balanceOf(deployer);
         console2.log("USDC balance:", usdcBal);
         console2.log("WETH balance:", wethBal);
-
-        require(usdcBal >= 5e5, "Need at least 0.5 USDC");
-        require(wethBal >= 0.0002 ether, "Need at least 0.0002 WETH");
+        require(usdcBal >= 65_000, "AddLiquidityUnichain: need >= 0.065 USDC for liquidity");
+        require(wethBal >= 0.000035 ether, "AddLiquidityUnichain: need >= 0.000035 WETH for liquidity");
 
         vm.startBroadcast(deployerPk);
 
-        // 1. Deploy router contract on-chain
-        LiquidityRouterUnichain router = new LiquidityRouterUnichain(POOL_MANAGER, LIQUIDITY_DELTA);
-        console2.log("Router deployed at:", address(router));
+        // 1) Initialize the pool (idempotent: skip if already initialized).
+        (uint160 existing,,,) = POOL_MANAGER.getSlot0(id);
+        if (existing == 0) {
+            POOL_MANAGER.initialize(poolKey, initSqrtPrice);
+            console2.log("Pool initialized. sqrtPriceX96:", initSqrtPrice);
+        } else {
+            console2.log("Pool already initialized. sqrtPriceX96:", existing);
+        }
 
-        // 2. Approve router to pull tokens from deployer (for transferFrom in callback)
+        // 2) Deploy the recoverable router, approve it to pull tokens, add liquidity.
+        LiquidityRouterUnichain router = new LiquidityRouterUnichain(POOL_MANAGER, LIQUIDITY_DELTA);
         IERC20(USDC).approve(address(router), type(uint256).max);
         IERC20(WETH).approve(address(router), type(uint256).max);
-
-        // 3. Also approve PoolManager directly (router uses transferFrom deployer->PM)
-        IERC20(USDC).approve(address(POOL_MANAGER), type(uint256).max);
-        IERC20(WETH).approve(address(POOL_MANAGER), type(uint256).max);
-
-        // 4. Call router to add liquidity (router receives the callback)
         router.addLiquidity(poolKey);
+
+        // Revoke the router's pull allowance — single-use, leave no lingering approval.
+        IERC20(USDC).approve(address(router), 0);
+        IERC20(WETH).approve(address(router), 0);
 
         vm.stopBroadcast();
 
-        // Check balances after
-        uint256 usdcAfter = IERC20(USDC).balanceOf(deployer);
-        uint256 wethAfter = IERC20(WETH).balanceOf(deployer);
-        console2.log("\n=== LIQUIDITY ADDED ===");
-        console2.log("USDC spent:", usdcBal - usdcAfter);
-        console2.log("WETH spent:", wethBal - wethAfter);
+        console2.log("\n=== POOL LIVE ===");
+        console2.log("Router:", address(router));
+        console2.log("USDC spent:", usdcBal - IERC20(USDC).balanceOf(deployer));
+        console2.log("WETH spent:", wethBal - IERC20(WETH).balanceOf(deployer));
+        console2.log("Active liquidity:", POOL_MANAGER.getLiquidity(id));
+        console2.log("PoolId (put this in frontend contracts.ts, chain 130):");
+        console2.logBytes32(PoolId.unwrap(id));
     }
 }
