@@ -43,7 +43,7 @@ export const DEPLOYMENTS: Record<8453 | 130, ChainDeployment> = {
   8453: {
     chainId: 8453,
     chainLabel: "BASE",
-    hook: "0x1afeB37bdC763c1FC8CCB4E30c39BFFe139894Ce",
+    hook: "0x4fB56294f7bFf30A4d85c1bA676f0CFdB24114ce",
     poolManager: "0x498581fF718922c3f8e6A244956aF099B2652b2b",
     stateView: "0xa3c0c9b65bad0b08107aa264b0f3db444b867a71",
     weth: WETH_BASE,
@@ -52,7 +52,7 @@ export const DEPLOYMENTS: Record<8453 | 130, ChainDeployment> = {
       symbol: "USDC",
       decimals: 6,
     },
-    poolId: "0x8d27ee1ba3ae15df876ab2929cc21e23109ba2e3f181222eb795466956727c08",
+    poolId: "0xc92fdde3c2264c8abe30cea3ee4d3ffeeef6ca009117e843158f8f8a5fe6f03e",
     poolFee: 3000,
     tickSpacing: 60,
     wethIsCurrency0: true,
@@ -64,7 +64,7 @@ export const DEPLOYMENTS: Record<8453 | 130, ChainDeployment> = {
   130: {
     chainId: 130,
     chainLabel: "UNICHAIN",
-    hook: "0x8C19f1641946c662308000bB4E2Eaf684c81d4CE",
+    hook: "0x3983130fcd18606afe659acdddb0018d21c254ce",
     poolManager: "0x1F98400000000000000000000000000000000004",
     stateView: "0x86e8631a016f9068c3f085faf484ee3f5fdee8f2",
     weth: WETH_BASE, // same OP-stack predeploy address on Unichain
@@ -73,7 +73,7 @@ export const DEPLOYMENTS: Record<8453 | 130, ChainDeployment> = {
       symbol: "USDC",
       decimals: 6,
     },
-    poolId: "0xe1d695d4c147091549aeb6f9e78521a0184a1e7e272a71c12e708c881981f6ba",
+    poolId: "0x093ab4b09860ac96a823165918b56e35837631d16440daa15385b3f0d7b23279",
     poolFee: 3000,
     tickSpacing: 60,
     wethIsCurrency0: false,

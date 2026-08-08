@@ -115,7 +115,7 @@ contract SetupPoolBase is Script {
     /// @dev DeployBaseAave, real Aave vault. Redeployed 2026-07-25 with the vault-path hardening
     ///      (saturating `_calculateIL`, measured-receipt claim, ZeroSharesMinted). Supersedes
     ///      0x17fE80F8a1ba277B1acd86D1622FaFC20CD254Ce, whose pool is now abandoned.
-    address constant HOOK = 0x1afeB37bdC763c1FC8CCB4E30c39BFFe139894Ce;
+    address constant HOOK = 0x4fB56294f7bFf30A4d85c1bA676f0CFdB24114ce;
 
     // Must match the frontend pool params (contracts.ts POOL_FEE / TICK_SPACING).
     uint24 constant POOL_FEE = 3000; // 0.30%

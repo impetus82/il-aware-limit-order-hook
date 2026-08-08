@@ -53,10 +53,10 @@ type ChainContracts = {
 const CHAIN_CONTRACTS: Record<number, ChainContracts> = {
   // ── Base Mainnet (8453) ─────────────────────────────
   8453: {
-    // DeployBaseAave — production hook wired to REAL Aave (waBasUSDC). Redeployed 2026-07-25 with
-    // the vault-path hardening (saturating _calculateIL, measured-receipt claim, ZeroSharesMinted);
-    // supersedes 0x17fE80…254Ce, and before that the demo hook 0x45d9…4040 (SimulatedYieldVault).
-    hook: "0x1afeB37bdC763c1FC8CCB4E30c39BFFe139894Ce",
+    // DeployBaseAave — production hook wired to REAL Aave (waBasUSDC). Redeployed 2026-08-08 carrying
+    // the internal-audit fixes (A1/A2 afterSwap DoS, A3 reentrancy gate, A4 measured-receipt on deposit);
+    // supersedes 0x1afe…94Ce, and before that 0x17fE80…254Ce / the demo hook 0x45d9…4040.
+    hook: "0x4fB56294f7bFf30A4d85c1bA676f0CFdB24114ce",
     stateView: "0xa3c0c9b65bad0b08107aa264b0f3db444b867a71",
     poolManager: "0x498581fF718922c3f8e6A244956aF099B2652b2b",
     weth: {
@@ -71,7 +71,7 @@ const CHAIN_CONTRACTS: Record<number, ChainContracts> = {
       name: "USD Coin",
       decimals: 6,
     },
-    poolId: "0x8d27ee1ba3ae15df876ab2929cc21e23109ba2e3f181222eb795466956727c08",
+    poolId: "0xc92fdde3c2264c8abe30cea3ee4d3ffeeef6ca009117e843158f8f8a5fe6f03e",
     explorerUrl: "https://basescan.org",
     chainLabel: "BASE",
     wethIsCurrency0: true,
@@ -80,11 +80,10 @@ const CHAIN_CONTRACTS: Record<number, ChainContracts> = {
   },
 
   // ── Unichain Mainnet (130) ──────────────────────────
-  // Redeployed via script/DeployHookathon.s.sol on 2026-05-19
-  // SimulatedYieldVault: 0xceee912C708516624E9aC5581c8FCC93eA8eE79d
-  // Pool init tx: 0x3a082b9cb10f1c632502396116cf2b62280509f98d68e52a6db12cba6104f5a4
+  // Redeployed via script/DeployHookathon.s.sol on 2026-08-08 carrying the internal-audit fixes;
+  // supersedes 0x8C19…d4CE. Demo SimulatedYieldVault (WETH): 0xad5e352E96B972BE0ae1eDd2d1f60E69bf1Ee608
   130: {
-    hook: "0x8C19f1641946c662308000bB4E2Eaf684c81d4CE",
+    hook: "0x3983130fcd18606afe659acdddb0018d21c254ce",
     stateView: "0x86e8631a016f9068c3f085faf484ee3f5fdee8f2",
     poolManager: "0x1F98400000000000000000000000000000000004",
     weth: {
@@ -99,7 +98,7 @@ const CHAIN_CONTRACTS: Record<number, ChainContracts> = {
       name: "USD Coin",
       decimals: 6,
     },
-    poolId: "0xe1d695d4c147091549aeb6f9e78521a0184a1e7e272a71c12e708c881981f6ba",
+    poolId: "0x093ab4b09860ac96a823165918b56e35837631d16440daa15385b3f0d7b23279",
     explorerUrl: "https://uniscan.xyz",
     chainLabel: "UNICHAIN",
     wethIsCurrency0: false,
